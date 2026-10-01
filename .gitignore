@@ -1,0 +1,6 @@
+# Echte HubSpot-Exporte gehören nie ins Repo – nur die erfundenen Testdaten.
+*.csv
+*.zip
+*.xlsx
+!test/testdaten.csv
+.DS_Store

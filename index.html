@@ -1,0 +1,1074 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anruf-Wochenboard</title>
+
+<!-- =====================================================================
+     KERN: Konfiguration, CSV-Parser, Klassifikation, Kennzahlen.
+     Reine Rechenlogik ohne Zugriff auf die Seite, damit sie sich auch
+     ohne Browser testen lässt (siehe test/tests.mjs).
+     ===================================================================== -->
+<script id="kern">
+'use strict';
+
+/* =====================================================================
+   KONFIGURATION – hier anpassen
+   ===================================================================== */
+
+// Stundenversatz, um den alle Uhrzeiten aus dem Export verschoben werden.
+// Die Zeiten im HubSpot-Export liegen nicht in deutscher Ortszeit.
+// Der Wert lässt sich auf der Seite ändern; das hier ist nur der Startwert.
+const STANDARD_STUNDENVERSATZ = 5;
+
+// Unter dieser Zahl von Anrufen wird jede Quote als "Stichprobe zu klein"
+// markiert. Eine Quote aus 3 Anrufen sagt nichts aus.
+const MINDEST_STICHPROBE = 10;
+
+/* ---------------------------------------------------------------------
+   KLASSIFIKATION DER ANRUFNOTIZEN
+
+   Jede Notiz landet in genau einer Kategorie, geprüft in dieser Reihenfolge:
+     1. Niemand erreicht     – Notiz enthält ein Wort aus WOERTER_NIEMAND_ERREICHT
+     2. Falscher Kontakt     – sonst: Notiz enthält ein Wort aus
+        oder abwesend          WOERTER_FALSCHER_KONTAKT
+     3. Gespräch             – sonst: alles, was übrig bleibt
+
+   So funktioniert die Suche:
+   - Es wird nach Wortteilen gesucht, Groß-/Kleinschreibung ist egal.
+     "abwesen" trifft also "abwesend" und "Abwesenheit".
+   - Enthält eine Notiz Wörter aus beiden Listen, gewinnt Liste 1.
+   - Neues Wort ergänzen: einfach eine Zeile 'wort', in die Liste schreiben.
+     Umlaute normal schreiben. Wer in Notizen "verfuegbar" tippt, braucht
+     zusätzlich 'nicht verfueg', als eigenen Eintrag.
+
+   Bekannte Stolperstellen:
+   - 'krank' trifft auch "Krankenhaus" und "Krankenkasse".
+   - 'leitungen' trifft auch "Weiterleitungen" und "Abteilungsleitungen".
+
+   WICHTIG – "Gespräch" ist eine OBERGRENZE:
+   Alles, was keine der beiden Listen trifft, zählt als Gespräch. Dazu gehören
+   auch Notizen wie "Rückruf morgen", "Info-Mail geschickt" oder Tippfehler wie
+   "Mailbx". Von Hand nachgezählt fällt die Zahl der Gespräche niedriger aus.
+   Wer solche Fälle findet, ergänzt hier das passende Wort.
+   --------------------------------------------------------------------- */
+
+// Liste 1: Niemand erreicht (Mailbox, besetzt, nicht abgenommen, tote Nummer)
+const WOERTER_NIEMAND_ERREICHT = [
+  'voicemail',
+  'mailbox',
+  'anrufbeantworter',
+  'besetzt',
+  'user busy',
+  'belegt',
+  'leitungen',             // "alle Leitungen belegt"
+  'geht nicht ran',
+  'nicht ran',
+  'geht niemand',
+  'niemand ran',
+  'klingelt nicht',
+  'nicht erreich',         // erreichbar, erreicht
+  'nicht verfügb',         // verfügbar
+  'nicht vergeben',        // "Rufnummer ist nicht vergeben"
+  'no connection',
+  'keine verbindung',
+  'rufnummer ist nicht',
+  'drückt mich weg',
+  'weggedrückt',
+  'feierabend',
+  'zentrale hat schon zu',
+
+  // Ergänzt nach dem echten Export vom 01.10.2026. Jedes Wort wurde gegen
+  // alle 301 Notizen geprüft und trifft dort kein echtes Gespräch.
+  'mobilbox',
+  'nicht verfüg',          // auch Tippfehler wie "verfügabr"
+  'nicht ans tel',         // "geht nicht ans Telefon/Telfon"
+  'nummer geht nicht',
+  'nummer gibt es nicht',
+  'falsche nummer',
+  'keine nummer hinterlegt',
+  'keine handynummer',
+  'nicht durchstellen',    // Zentrale stellt nicht durch
+  'nicht weiterleiten',
+  'blockt',                // "Zentrale blockt ab"
+  'in einer besprechung',  // Auskunft der Zentrale
+  'gewartet',              // "2 min gewartet", Warteschleife
+  'nicht an seinem platz',
+  // Bewusst NICHT aufgenommen, weil sie in den echten Daten auch Gespräche treffen:
+  // 'nochmal probieren', 'in einem meeting', 'in einem termin', 'gibt es nicht'
+];
+
+// Liste 2: Falscher Kontakt oder abwesend (Person erreicht man so nicht)
+const WOERTER_FALSCHER_KONTAKT = [
+  'arbeitet nicht mehr',
+  'arbeitet da nicht',
+  'alter ansprechpartner',
+  'gekündigt',
+  'nicht mehr da',
+  'nicht im haus',
+  'betriebsurlaub',
+  'urlaub bis',
+  'abwesen',               // abwesend, Abwesenheit
+  'elternzeit',
+  'krank',                 // Achtung: trifft auch "Krankenkasse"
+
+  // Ergänzt nach dem echten Export vom 01.10.2026
+  'ruhestand',
+  // Bewusst NICHT aufgenommen: 'im urlaub' – in den echten Daten waren 4 von 5
+  // Treffern echte Gespräche ("ist im Urlaub, aber gerne ab dem 17. August").
+];
+
+// Häufige Tippfehler, die vor der Stichwortsuche korrigiert werden.
+// Nur ganze Wörter: links der Tippfehler, rechts das richtige Wort.
+const TIPPFEHLER = {
+  'nciht': 'nicht',
+  'ncht':  'nicht',
+  'nivht': 'nicht',
+  'nihct': 'nicht',
+  'nicth': 'nicht',
+};
+
+// Notizen mit diesem Inhalt (oder leer) sind keine Anrufe und fliegen raus.
+// Auch in allen anderen Spalten wird "(Kein Wert)" als leer behandelt.
+const KEIN_WERT = '(kein wert)';
+
+// Spaltennamen im HubSpot-Export (Groß-/Kleinschreibung egal)
+const SPALTEN = {
+  notiz:        'Anrufnotizen',
+  telefon:      'Telefonnummer',
+  datum:        'Aktivitätsdatum',
+  firma:        'Unternehmensname',
+  nachname:     'Nachname',
+  vorname:      'Vorname',
+  engagementId: 'Engagement ID',
+  kontaktId:    'Kontakt ID',
+};
+const PFLICHTSPALTEN = ['notiz', 'datum'];
+
+// Deutsche Mobilfunk-Vorwahlen ohne führende 0 (also 015x, 016x, 017x)
+const MOBIL_VORWAHLEN = ['15', '16', '17'];
+
+const KATEGORIEN = {
+  gespraech: 'Gespräch',
+  niemand:   'Niemand erreicht',
+  falsch:    'Falscher Kontakt / abwesend',
+};
+const NUMMERNTYPEN = {
+  mobil:    'Mobil',
+  festnetz: 'Festnetz / Durchwahl',
+  ausland:  'Ausland',
+  keine:    'Keine Nummer',
+};
+const WOCHENTAGE = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+
+/* =====================================================================
+   CSV-PARSER
+   Verarbeitet: Semikolon, Komma oder Tab als Trennzeichen (automatisch
+   erkannt), Felder in doppelten Anführungszeichen mit Trennzeichen,
+   Zeilenumbrüchen und verdoppelten Anführungszeichen ("") darin,
+   Zeilenenden \n, \r\n und \r, UTF-8-BOM am Anfang.
+   ===================================================================== */
+
+function entferneBom(text) {
+  return text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+}
+
+// Zählt Trennzeichen-Kandidaten in der Kopfzeile (außerhalb von Anführungszeichen).
+function erkenneTrennzeichen(text) {
+  const anzahl = { ';': 0, ',': 0, '\t': 0 };
+  let inAnf = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') inAnf = !inAnf;
+    else if (!inAnf) {
+      if (c === '\n' || c === '\r') break;
+      if (c in anzahl) anzahl[c]++;
+    }
+  }
+  let bestes = ';';
+  for (const t of [',', '\t']) if (anzahl[t] > anzahl[bestes]) bestes = t;
+  return bestes;
+}
+
+function parseCSV(text, trennzeichen) {
+  text = entferneBom(text);
+  const trenn = trennzeichen || erkenneTrennzeichen(text);
+  const zeilen = [];
+  let zeile = [];
+  let feld = '';
+  let inAnf = false;      // gerade innerhalb eines Felds in Anführungszeichen
+  let feldAnfang = true;  // noch kein Zeichen des aktuellen Felds gelesen
+  const n = text.length;
+
+  const feldEnde = () => { zeile.push(feld); feld = ''; feldAnfang = true; };
+  const zeileEnde = () => {
+    feldEnde();
+    // komplett leere Zeilen überspringen
+    if (!(zeile.length === 1 && zeile[0] === '')) zeilen.push(zeile);
+    zeile = [];
+  };
+
+  for (let i = 0; i < n; i++) {
+    const c = text[i];
+    if (inAnf) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { feld += '"'; i++; }  // "" = ein Anführungszeichen
+        else inAnf = false;                              // Feld in Anführungszeichen zu Ende
+      } else {
+        feld += c;                                       // auch ; , und Zeilenumbrüche
+      }
+      continue;
+    }
+    if (c === '"' && feldAnfang) { inAnf = true; feldAnfang = false; continue; }
+    if (c === trenn) { feldEnde(); continue; }
+    if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      zeileEnde();
+      continue;
+    }
+    feld += c;  // Anführungszeichen mitten im Feld (z. B. 24" Monitor) bleiben stehen
+    feldAnfang = false;
+  }
+  if (feld !== '' || zeile.length > 0) zeileEnde();
+  return { zeilen, trennzeichen: trenn };
+}
+
+/* =====================================================================
+   AUFBEREITUNG
+   ===================================================================== */
+
+function normalisiere(s) {
+  return String(s == null ? '' : s).normalize('NFC').trim();
+}
+
+function zelle(s) {
+  const v = normalisiere(s).replace(/\r\n?/g, '\n');
+  return v.toLowerCase() === KEIN_WERT ? '' : v;
+}
+
+// HubSpot speichert Notizen teils als HTML (<p>, <br>, &amp;). Für Anzeige
+// und Klassifikation wird daraus reiner Text.
+function htmlZuText(s) {
+  if (!/[<&]/.test(s)) return s;
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+const _niemand = WOERTER_NIEMAND_ERREICHT.map(w => w.normalize('NFC').toLowerCase());
+const _falsch = WOERTER_FALSCHER_KONTAKT.map(w => w.normalize('NFC').toLowerCase());
+
+const _tippfehler = new RegExp(`(^|[^a-zäöüß])(${Object.keys(TIPPFEHLER).join('|')})(?![a-zäöüß])`, 'g');
+
+function klassifiziere(notiz) {
+  const t = normalisiere(notiz).toLowerCase()
+    .replace(_tippfehler, (_, davor, wort) => davor + TIPPFEHLER[wort]);
+  for (const w of _niemand) if (t.includes(w)) return { kategorie: 'niemand', treffer: w };
+  for (const w of _falsch) if (t.includes(w)) return { kategorie: 'falsch', treffer: w };
+  return { kategorie: 'gespraech', treffer: null };
+}
+
+function nummernTyp(telefon) {
+  let d = normalisiere(telefon).replace(/\(0\)/g, '').replace(/[^\d+]/g, '');
+  if (!/\d/.test(d)) return 'keine';
+  if (d.startsWith('+')) d = d.slice(1);
+  else if (d.startsWith('00')) d = d.slice(2);
+  else if (d.startsWith('0')) d = '49' + d.slice(1);   // nationale Schreibweise 0151 …
+  if (!d.startsWith('49')) return 'ausland';
+  let rest = d.slice(2);
+  if (rest.startsWith('0')) rest = rest.slice(1);       // +49 0151 …
+  return MOBIL_VORWAHLEN.some(v => rest.startsWith(v)) ? 'mobil' : 'festnetz';
+}
+
+// "2026-10-01 05:33" (auch mit Sekunden oder als "01.10.2026 05:33").
+// Rückgabe: Date, dessen UTC-Felder die korrigierte deutsche Uhrzeit sind.
+// So spielt die Zeitzone des Rechners keine Rolle.
+function parseDatum(s, versatzStunden) {
+  s = normalisiere(s);
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})/);
+  let j, mo, t, h, mi;
+  if (m) [, j, mo, t, h, mi] = m;
+  else {
+    m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4}),?\s+(\d{1,2}):(\d{2})/);
+    if (!m) return null;
+    [, t, mo, j, h, mi] = m;
+  }
+  const ms = Date.UTC(+j, +mo - 1, +t, +h, +mi) + (Number(versatzStunden) || 0) * 3600e3;
+  const d = new Date(ms);
+  return isNaN(d) ? null : d;
+}
+
+const zweistellig = n => String(n).padStart(2, '0');
+function isoTag(d) {
+  return `${d.getUTCFullYear()}-${zweistellig(d.getUTCMonth() + 1)}-${zweistellig(d.getUTCDate())}`;
+}
+
+function spaltenIndex(kopf) {
+  const norm = kopf.map(k => normalisiere(k).toLowerCase());
+  const idx = {};
+  for (const [schluessel, name] of Object.entries(SPALTEN)) {
+    idx[schluessel] = norm.indexOf(name.normalize('NFC').toLowerCase());
+  }
+  const fehlend = PFLICHTSPALTEN.filter(k => idx[k] < 0).map(k => SPALTEN[k]);
+  return { idx, fehlend };
+}
+
+// Macht aus dem CSV-Text eine Liste von Anrufen.
+function leseAnrufe(text, versatzStunden) {
+  const { zeilen, trennzeichen } = parseCSV(text);
+  if (zeilen.length === 0) throw new Error('Die Datei ist leer.');
+  const { idx, fehlend } = spaltenIndex(zeilen[0]);
+  if (fehlend.length) {
+    throw new Error(`Spalte fehlt: ${fehlend.join(', ')}. Gefunden: ${zeilen[0].join(' | ')}`);
+  }
+  const hole = (z, k) => (idx[k] >= 0 ? zelle(z[idx[k]]) : '');
+
+  const stat = { datenzeilen: zeilen.length - 1, keinAnruf: 0, dubletten: 0, ohneDatum: 0, trennzeichen };
+  const gesehen = new Set();
+  const anrufe = [];
+
+  for (let r = 1; r < zeilen.length; r++) {
+    const z = zeilen[r];
+    const notiz = htmlZuText(hole(z, 'notiz'));
+    if (!notiz) { stat.keinAnruf++; continue; }
+
+    const engagementId = hole(z, 'engagementId');
+    if (engagementId) {
+      if (gesehen.has(engagementId)) { stat.dubletten++; continue; }
+      gesehen.add(engagementId);
+    }
+
+    const zeit = parseDatum(hole(z, 'datum'), versatzStunden);
+    if (!zeit) { stat.ohneDatum++; continue; }
+
+    const telefon = hole(z, 'telefon');
+    const { kategorie, treffer } = klassifiziere(notiz);
+    anrufe.push({
+      notiz, telefon, engagementId,
+      firma: hole(z, 'firma'),
+      vorname: hole(z, 'vorname'),
+      nachname: hole(z, 'nachname'),
+      kontaktId: hole(z, 'kontaktId'),
+      zeit,
+      tag: isoTag(zeit),
+      wochentag: (zeit.getUTCDay() + 6) % 7,   // 0 = Montag
+      stunde: zeit.getUTCHours(),
+      nummerTyp: nummernTyp(telefon),
+      kategorie, treffer,
+    });
+  }
+  anrufe.sort((a, b) => a.zeit - b.zeit);
+  return { anrufe, stat };
+}
+
+/* =====================================================================
+   ZEITRÄUME
+   Wochen laufen Montag bis Sonntag. "heute" ist ein Datum "JJJJ-MM-TT".
+   ===================================================================== */
+
+function tagPlus(iso, tage) {
+  const [j, m, t] = iso.split('-').map(Number);
+  return isoTag(new Date(Date.UTC(j, m - 1, t + tage)));
+}
+
+function heuteIso(jetzt = new Date()) {
+  return `${jetzt.getFullYear()}-${zweistellig(jetzt.getMonth() + 1)}-${zweistellig(jetzt.getDate())}`;
+}
+
+function zeitraum(art, heute) {
+  const [j, m, t] = heute.split('-').map(Number);
+  const montag = tagPlus(heute, -((new Date(Date.UTC(j, m - 1, t)).getUTCDay() + 6) % 7));
+  switch (art) {
+    case 'woche':       return { von: montag, bis: tagPlus(montag, 6) };
+    case 'letzteWoche': return { von: tagPlus(montag, -7), bis: tagPlus(montag, -1) };
+    case '30tage':      return { von: tagPlus(heute, -29), bis: heute };
+    default:            return { von: null, bis: null };
+  }
+}
+
+/* =====================================================================
+   KENNZAHLEN
+   ===================================================================== */
+
+function leererTopf() {
+  return { anrufe: 0, gespraech: 0, niemand: 0, falsch: 0 };
+}
+function zaehle(topf, a) {
+  topf.anrufe++;
+  topf[a.kategorie]++;
+}
+function mitQuote(topf) {
+  topf.quote = topf.anrufe ? topf.gespraech / topf.anrufe : null;
+  topf.kleineStichprobe = topf.anrufe < MINDEST_STICHPROBE;
+  return topf;
+}
+
+function kontaktSchluessel(a) {
+  if (a.kontaktId) return 'id:' + a.kontaktId;
+  const name = `${a.vorname} ${a.nachname}`.trim().toLowerCase();
+  if (!name && !a.telefon) return null;
+  return 'name:' + name + '|' + a.telefon.replace(/\D/g, '');
+}
+
+function auswerten(alleAnrufe, von, bis) {
+  const anrufe = alleAnrufe.filter(a => (!von || a.tag >= von) && (!bis || a.tag <= bis));
+
+  const gesamt = leererTopf();
+  const kontakte = new Set();
+  const firmen = new Map();      // klein geschrieben -> { name, ...Topf, kontakte }
+  const tage = new Map();
+  const wochentage = WOCHENTAGE.map(() => leererTopf());
+  const stunden = Array.from({ length: 24 }, () => leererTopf());
+  const nummern = Object.fromEntries(Object.keys(NUMMERNTYPEN).map(k => [k, leererTopf()]));
+
+  for (const a of anrufe) {
+    zaehle(gesamt, a);
+    const ks = kontaktSchluessel(a);
+    if (ks) kontakte.add(ks);
+    if (a.firma) {
+      const fk = a.firma.toLowerCase();
+      if (!firmen.has(fk)) firmen.set(fk, Object.assign(leererTopf(), { name: a.firma, kontakte: new Set() }));
+      const f = firmen.get(fk);
+      zaehle(f, a);
+      if (ks) f.kontakte.add(ks);
+    }
+    if (!tage.has(a.tag)) tage.set(a.tag, leererTopf());
+    zaehle(tage.get(a.tag), a);
+    zaehle(wochentage[a.wochentag], a);
+    zaehle(stunden[a.stunde], a);
+    zaehle(nummern[a.nummerTyp], a);
+  }
+
+  const topFirmen = [...firmen.values()]
+    .map(f => mitQuote(Object.assign(f, { kontakte: f.kontakte.size })))
+    .sort((x, y) => y.anrufe - x.anrufe || y.gespraech - x.gespraech || x.name.localeCompare(y.name, 'de'));
+
+  return {
+    von, bis,
+    anrufe,
+    gesamt: mitQuote(gesamt),
+    kontakte: kontakte.size,
+    firmen: firmen.size,
+    telefontage: tage.size,
+    proTag: [...tage.entries()].sort().map(([tag, t]) => Object.assign(mitQuote(t), { tag })),
+    proWochentag: wochentage.map((t, i) => Object.assign(mitQuote(t), { label: WOCHENTAGE[i] })),
+    proStunde: stunden.map((t, h) => Object.assign(mitQuote(t), { stunde: h })),
+    proNummerTyp: Object.entries(nummern).map(([typ, t]) => Object.assign(mitQuote(t), { typ, label: NUMMERNTYPEN[typ] })),
+    gespraeche: anrufe.filter(a => a.kategorie === 'gespraech'),
+    topFirmen,
+  };
+}
+
+// Für Tests und Oberfläche gebündelt
+const ADRIC = {
+  STANDARD_STUNDENVERSATZ, MINDEST_STICHPROBE, KATEGORIEN, NUMMERNTYPEN, WOCHENTAGE,
+  parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
+  leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
+};
+</script>
+
+<!-- Schrift mit gleich breiten Ziffern. Ohne Internet greift die Systemschrift,
+     die Ziffern bleiben über font-variant-numeric trotzdem gleich breit. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+/* ---------- Farben: hell ---------- */
+:root {
+  --bg: #f4f4f1;
+  --card: #ffffff;
+  --ink: #141413;
+  --ink-2: #52514e;
+  --muted: #6f6e69;
+  --line: #e3e2dc;
+  --line-2: #cfcec6;
+  --accent: #2a78d6;
+  --accent-soft: rgba(42, 120, 214, 0.10);
+  --on-accent: #ffffff;
+  /* Ergebnisfarben: Gespräch / falscher Kontakt / niemand erreicht */
+  --good: #0ca30c;
+  --warn: #fab219;
+  --bad: #d03b3b;
+  --good-ink: #006300;
+  --warn-ink: #7a5200;
+  --bad-ink: #a82525;
+  --tip-bg: #141413;
+  --tip-ink: #ffffff;
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color-scheme: light;
+}
+/* ---------- Farben: dunkel (System-Einstellung oder Umschalter) ---------- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d0d0d; --card: #1a1a19; --ink: #f4f4f1; --ink-2: #c3c2b7; --muted: #9a998f;
+    --line: #2c2c2a; --line-2: #42423f; --accent: #3987e5; --accent-soft: rgba(57, 135, 229, 0.16);
+    --on-accent: #ffffff; --good-ink: #3fc43f; --warn-ink: #fab219; --bad-ink: #f07a7a;
+    --tip-bg: #f4f4f1; --tip-ink: #141413; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0d0d; --card: #1a1a19; --ink: #f4f4f1; --ink-2: #c3c2b7; --muted: #9a998f;
+  --line: #2c2c2a; --line-2: #42423f; --accent: #3987e5; --accent-soft: rgba(57, 135, 229, 0.16);
+  --on-accent: #ffffff; --good-ink: #3fc43f; --warn-ink: #fab219; --bad-ink: #f07a7a;
+  --tip-bg: #f4f4f1; --tip-ink: #141413; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 var(--sans); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+[hidden] { display: none !important; }
+.zahl, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* Kopf */
+.kopf { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.sub { font-family: var(--mono); font-size: 13px; color: var(--ink-2); margin-top: 2px; }
+.kopf-knoepfe { display: flex; gap: 8px; }
+
+/* Bausteine */
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+h2 .h2-zusatz { font-weight: 400; font-size: 13px; color: var(--muted); }
+.knopf { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 7px;
+  border: 1px solid var(--accent); background: var(--accent); color: var(--on-accent); cursor: pointer; }
+.knopf.leise { background: transparent; color: var(--ink-2); border-color: var(--line-2); }
+.knopf:hover { filter: brightness(1.05); }
+.knopf.leise:hover { background: var(--accent-soft); filter: none; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Startfläche */
+.drop { border: 2px dashed var(--line-2); text-align: center; padding: 48px 16px; }
+.drop p { margin: 6px 0; }
+.drop .muted { color: var(--muted); font-size: 13px; }
+.ziehen-overlay { position: fixed; inset: 0; display: none; place-items: center; background: var(--accent-soft);
+  border: 3px dashed var(--accent); font-size: 20px; font-weight: 600; color: var(--accent); z-index: 10; pointer-events: none; }
+body.zieht .ziehen-overlay { display: grid; }
+
+/* Steuerung */
+.controls { display: flex; flex-wrap: wrap; gap: 14px 20px; align-items: flex-end; margin-bottom: 12px; }
+.feld { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
+.seg button { font: inherit; font-size: 14px; padding: 7px 12px; border: 0; border-right: 1px solid var(--line-2);
+  background: transparent; color: var(--ink-2); cursor: pointer; }
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--accent-soft); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+input[type="date"], input[type="number"] { font-family: var(--mono); font-size: 14px; padding: 6px 8px; border: 1px solid var(--line-2);
+  border-radius: 7px; background: var(--card); color: var(--ink); min-height: 35px; }
+input[type="number"] { width: 70px; }
+.einheit { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 14px; }
+.datei { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
+
+.fehler { border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--card)); color: var(--bad-ink);
+  border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; white-space: pre-wrap; }
+.hinweis-leer { text-align: center; padding: 32px 16px; color: var(--ink-2); }
+
+/* Kennzahlenband */
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+.kpi .titel { font-size: 13px; color: var(--ink-2); }
+.kpi .wert { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 34px; font-weight: 500; line-height: 1.15; margin: 4px 0 2px; }
+.kpi .zusatz { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+
+/* Hinweis kleine Stichprobe: bewusst neutral, damit er nicht mit den Ergebnisfarben verwechselt wird */
+.klein { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; line-height: 1.2; color: var(--ink-2);
+  border: 1px solid var(--line-2); border-radius: 999px; padding: 2px 8px; white-space: nowrap; font-family: var(--sans); }
+.quote-unsicher { color: var(--muted); }
+
+/* Ergebnis-Aufteilung */
+.legende { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--ink-2); }
+.legende span { display: inline-flex; align-items: center; gap: 6px; }
+.farbe { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.f-gespraech { background: var(--good); }
+.f-falsch { background: var(--warn); }
+.f-niemand { background: var(--bad); }
+.aufteilung { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+.aufteilung .titel { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.aufteilung .zahl { font-size: 22px; }
+.aufteilung .anteil { color: var(--muted); font-family: var(--mono); font-size: 13px; }
+.balken-gross { display: flex; gap: 2px; height: 22px; margin-top: 12px; }
+.balken-gross i { border-radius: 4px; }
+.notiz-klein { font-size: 12.5px; color: var(--muted); margin: 14px 0 0; }
+
+/* Raster der Auswertungen */
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.grid > *, .kpis > * { min-width: 0; }
+.voll { grid-column: 1 / -1; }
+
+/* Balkenzeilen: Bezeichnung | Balken | Anrufe | Quote | Hinweis */
+.reihen { font-size: 14px; }
+.reihe { display: grid; grid-template-columns: 136px minmax(60px, 1fr) 44px 52px 150px; grid-template-areas: "l b n q w";
+  align-items: center; gap: 4px 10px; padding: 5px 4px; border-radius: 6px; }
+.reihe:hover { background: var(--accent-soft); }
+.reihe.kopfzeile { font-size: 12px; color: var(--muted); padding-top: 0; }
+.reihe.kopfzeile:hover { background: none; }
+.reihe .l { grid-area: l; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reihe .b { grid-area: b; }
+.reihe .n { grid-area: n; text-align: right; }
+.reihe .q { grid-area: q; text-align: right; }
+.reihe .w { grid-area: w; }
+.reihe.leer .l, .reihe.leer .n { color: var(--muted); }
+.balken { display: flex; gap: 2px; height: 14px; }
+.balken i, .balken-gross i { display: block; min-width: 3px; }
+.balken i { border-radius: 3px; }
+
+/* Tabellen */
+.tabelle { width: 100%; border-collapse: collapse; font-size: 14px; }
+.tabelle th { text-align: left; font-weight: 500; font-size: 12px; color: var(--muted); padding: 0 12px 6px 0; border-bottom: 1px solid var(--line); }
+.tabelle td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tabelle tr:last-child td { border-bottom: 0; }
+.tabelle .num { text-align: right; white-space: nowrap; }
+.tabelle th.num { font-family: var(--sans); }
+.tabelle .notiztext { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tabelle .zeit { white-space: nowrap; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; }
+.tabelle .mini { width: 30%; min-width: 90px; }
+.fuss { font-size: 12.5px; color: var(--muted); margin: 16px 0 0; }
+
+/* Tooltip */
+.tip { position: fixed; z-index: 20; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font-size: 12.5px;
+  line-height: 1.4; padding: 6px 9px; border-radius: 6px; white-space: pre; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* Tablet und Handy */
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .kpis { grid-template-columns: repeat(2, 1fr); }
+  .kpi .wert { font-size: 28px; }
+  .datei { margin-left: 0; }
+}
+@media (max-width: 560px) {
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .controls > .feld:first-child, .controls .datei, .controls > .feld:nth-child(4) { grid-column: 1 / -1; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; }
+  .seg button { border-right: 0; border-bottom: 1px solid var(--line-2); }
+  .seg button:nth-child(odd) { border-right: 1px solid var(--line-2); }
+  .seg button:nth-child(n+3) { border-bottom: 0; }
+  input[type="date"] { width: 100%; }
+  .kpi .wert { font-size: 26px; }
+  .reihe { grid-template-columns: 1fr 44px 52px; grid-template-areas: "l n q" "b b b" "w w w"; }
+  .reihe .w:empty { display: none; }
+  .reihe.kopfzeile .b, .reihe.kopfzeile .w { display: none; }
+  .aufteilung { grid-template-columns: 1fr; gap: 6px; }
+  .aufteilung > div { display: flex; align-items: baseline; gap: 10px; }
+  .aufteilung .zahl { font-size: 18px; margin-left: auto; }
+  .gespraeche thead { display: none; }
+  .gespraeche tr { display: block; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .gespraeche tr:last-child { border-bottom: 0; }
+  .gespraeche td { display: block; border: 0; padding: 1px 0; }
+  .gespraeche td.zeit { color: var(--muted); }
+  .gespraeche td.notiztext { margin-top: 4px; }
+  .firmen .mini { display: none; }
+}
+
+/* Druck / PDF: immer hell, ohne Bedienelemente */
+@media print {
+  :root:root:root {
+    --bg: #ffffff; --card: #ffffff; --ink: #141413; --ink-2: #52514e; --muted: #6f6e69; --line: #e3e2dc; --line-2: #cfcec6;
+    --good-ink: #006300; --warn-ink: #7a5200; --bad-ink: #a82525; color-scheme: light;
+  }
+  .no-print, #start, .tip { display: none !important; }
+  .wrap { max-width: none; padding: 0; }
+  .card { break-inside: avoid; }
+  .reihe:hover { background: none; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="kopf">
+    <div>
+      <h1>Anruf-Wochenboard</h1>
+      <div class="sub" id="zeitraumText">HubSpot-Anrufnotizen auswerten</div>
+    </div>
+    <div class="kopf-knoepfe no-print">
+      <button class="knopf leise" id="drucken" type="button" hidden>Drucken / PDF</button>
+      <button class="knopf leise" id="thema" type="button">Darstellung: Auto</button>
+    </div>
+  </header>
+
+  <section id="start" class="card drop">
+    <p><strong>CSV-Datei hier hineinziehen</strong></p>
+    <p>oder <label class="knopf">Datei auswählen<input type="file" accept=".csv,text/csv,text/plain" hidden data-datei></label></p>
+    <p class="muted">HubSpot-Export „Anrufsnotizen“, Semikolon oder Komma getrennt.<br>
+      Die Datei wird nur in diesem Browser gelesen und nirgendwohin hochgeladen.</p>
+  </section>
+
+  <section id="steuerung" class="card controls no-print" hidden>
+    <div class="feld">Zeitraum
+      <div class="seg" role="group" aria-label="Zeitraum">
+        <button type="button" data-art="woche">Diese Woche</button>
+        <button type="button" data-art="letzteWoche">Letzte Woche</button>
+        <button type="button" data-art="30tage">Letzte 30 Tage</button>
+        <button type="button" data-art="alles">Alles</button>
+      </div>
+    </div>
+    <label class="feld">Von<input type="date" id="von"></label>
+    <label class="feld">Bis<input type="date" id="bis"></label>
+    <label class="feld">Stundenversatz
+      <span class="einheit"><input type="number" id="versatz" step="1" min="-14" max="14"> Stunden</span>
+    </label>
+    <div class="datei">
+      <span id="dateiname"></span>
+      <label class="knopf leise">Andere Datei<input type="file" accept=".csv,text/csv,text/plain" hidden data-datei></label>
+    </div>
+  </section>
+
+  <div id="fehler" class="fehler" role="alert" hidden></div>
+
+  <main id="board" hidden>
+    <section class="kpis" id="kpis"></section>
+    <section class="card" id="ergebnis"></section>
+    <section class="card hinweis-leer" id="leer" hidden></section>
+    <div class="grid" id="auswertungen">
+      <section class="card"><h2>Anrufe und Quote pro Tag</h2><div id="proTag"></div></section>
+      <section class="card"><h2>Anrufe und Quote pro Wochentag</h2><div id="proWochentag"></div></section>
+      <section class="card"><h2>Anrufe und Quote pro Stunde <span class="h2-zusatz" id="stundeZusatz"></span></h2><div id="proStunde"></div></section>
+      <section class="card"><h2>Erreichbarkeit nach Nummerntyp</h2><div id="proNummer"></div></section>
+      <section class="card voll"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
+      <section class="card voll"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
+    </div>
+    <p class="fuss" id="fuss"></p>
+  </main>
+</div>
+<div class="ziehen-overlay" aria-hidden="true">Datei loslassen</div>
+<div class="tip" id="tip" hidden></div>
+
+<!-- =====================================================================
+     OBERFLÄCHE
+     ===================================================================== -->
+<script>
+'use strict';
+(() => {
+  const $ = s => document.querySelector(s);
+  const $$ = s => [...document.querySelectorAll(s)];
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Browser-Speicher nur für Bequemlichkeit (Darstellung, Versatz).
+  // Kann im privaten Fenster fehlen, daher immer abgesichert.
+  const speicher = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* egal */ } },
+  };
+
+  const gespeicherterVersatz = parseFloat(speicher.get('adric.versatz'));
+  const zustand = {
+    text: null,
+    dateiname: '',
+    versatz: Number.isFinite(gespeicherterVersatz) ? gespeicherterVersatz : STANDARD_STUNDENVERSATZ,
+    art: 'woche',          // woche | letzteWoche | 30tage | alles | eigen
+    von: null,
+    bis: null,
+    daten: null,           // Ergebnis von leseAnrufe
+  };
+
+  /* ---------- Formatierung ---------- */
+  const KURZTAG = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
+  const zahl = n => n.toLocaleString('de-DE');
+  const prozent = q => q == null ? '–' : Math.round(q * 100) + ' %';
+  const isoZuDate = iso => { const [j, m, t] = iso.split('-').map(Number); return new Date(Date.UTC(j, m - 1, t)); };
+  const tagKurz = iso => { const d = isoZuDate(iso); return `${KURZTAG[(d.getUTCDay() + 6) % 7]} ${iso.slice(8, 10)}.${iso.slice(5, 7)}.`; };
+  const datumLang = iso => `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}`;
+  const uhrzeit = d => `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+  const versatzText = v => (v >= 0 ? '+' : '−') + Math.abs(v) + ' h';
+  function kalenderwoche(iso) {
+    const d = isoZuDate(iso);
+    d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));       // Donnerstag derselben Woche
+    const jan4 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+    return 1 + Math.round(((d - jan4) / 864e5 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
+  }
+  function zeitraumBeschriftung(von, bis) {
+    if (!von && !bis) return 'Alle Daten';
+    const v = von ? datumLang(von) : 'Anfang', b = bis ? datumLang(bis) : 'Ende';
+    const istWoche = von && bis && kalenderwoche(von) === kalenderwoche(bis) && tagPlus(von, 6) === bis;
+    return (istWoche ? `KW ${kalenderwoche(von)} · ` : '') + `${v} – ${b}`;
+  }
+
+  /* ---------- Kleine Bausteine ---------- */
+  const STICHPROBE_TITEL = `Weniger als ${MINDEST_STICHPROBE} Anrufe – die Quote ist nicht belastbar`;
+  const kleinHinweis = n => `<span class="klein" title="${esc(STICHPROBE_TITEL)}">⚠ Stichprobe zu klein (${n})</span>`;
+  const legende = () => `<div class="legende">
+      <span><i class="farbe f-gespraech"></i>Gespräch</span>
+      <span><i class="farbe f-falsch"></i>Falscher Kontakt / abwesend</span>
+      <span><i class="farbe f-niemand"></i>Niemand erreicht</span></div>`;
+
+  function aufteilungText(t) {
+    return `Gespräch           ${String(t.gespraech).padStart(4)}\n` +
+           `Falsch / abwesend  ${String(t.falsch).padStart(4)}\n` +
+           `Niemand erreicht   ${String(t.niemand).padStart(4)}\n` +
+           `Anrufe gesamt      ${String(t.anrufe).padStart(4)}` +
+           (t.quote != null ? `\nGesprächsquote     ${prozent(t.quote).padStart(5)}` : '') +
+           (t.kleineStichprobe && t.anrufe ? `\n⚠ Stichprobe zu klein` : '');
+  }
+
+  // Gestapelter Balken: Länge = Anrufe, Teile = Ergebnis
+  function balken(t, max, klasse = 'balken') {
+    if (!t.anrufe) return `<div class="${klasse}"></div>`;
+    const teile = [['gespraech', t.gespraech], ['falsch', t.falsch], ['niemand', t.niemand]]
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => `<i class="f-${k}" style="flex:${n}"></i>`).join('');
+    const breite = max ? (t.anrufe / max) * 100 : 0;
+    return `<div class="${klasse}" style="width:${breite.toFixed(2)}%" role="img"
+      aria-label="${t.anrufe} Anrufe, davon ${t.gespraech} Gespräche, ${t.falsch} falscher Kontakt, ${t.niemand} niemand erreicht">${teile}</div>`;
+  }
+
+  function reihen(eintraege) {
+    if (!eintraege.length) return '<p class="notiz-klein">Keine Anrufe.</p>';
+    const max = Math.max(...eintraege.map(e => e.t.anrufe));
+    const kopf = `<div class="reihe kopfzeile"><span class="l"></span><span class="b"></span>
+      <span class="n">Anrufe</span><span class="q">Quote</span><span class="w"></span></div>`;
+    const zeilen = eintraege.map(({ label, t }) => {
+      const unsicher = t.anrufe > 0 && t.kleineStichprobe;
+      return `<div class="reihe${t.anrufe ? '' : ' leer'}" data-tip="${esc(label + '\n' + aufteilungText(t))}">
+        <span class="l">${esc(label)}</span>
+        <span class="b">${balken(t, max)}</span>
+        <span class="n num">${zahl(t.anrufe)}</span>
+        <span class="q num${unsicher ? ' quote-unsicher' : ''}">${t.anrufe ? prozent(t.quote) : '–'}</span>
+        <span class="w">${unsicher ? kleinHinweis(t.anrufe) : ''}</span></div>`;
+    }).join('');
+    return `<div class="reihen">${kopf}${zeilen}</div>`;
+  }
+
+  /* ---------- Darstellung des Boards ---------- */
+  function zeichne() {
+    const d = zustand.daten;
+    $('#start').hidden = !!d;
+    $('#steuerung').hidden = !d;
+    $('#board').hidden = !d;
+    $('#drucken').hidden = !d;
+    if (!d) return;
+
+    $$('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.art === zustand.art)));
+    const erster = d.anrufe[0]?.tag, letzter = d.anrufe[d.anrufe.length - 1]?.tag;
+    $('#von').value = zustand.von || erster || '';
+    $('#bis').value = zustand.bis || letzter || '';
+    $('#versatz').value = zustand.versatz;
+    $('#dateiname').textContent = zustand.dateiname;
+
+    const r = auswerten(d.anrufe, zustand.von, zustand.bis);
+    const g = r.gesamt;
+    $('#zeitraumText').textContent = zeitraumBeschriftung(zustand.von, zustand.bis);
+
+    // Kennzahlenband
+    const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    $('#kpis').innerHTML = `
+      <div class="card kpi"><div class="titel">Anrufe</div><div class="wert">${zahl(g.anrufe)}</div>
+        <div class="zusatz">an ${zahl(r.telefontage)} Telefontag${r.telefontage === 1 ? '' : 'en'} · Ø ${proTag} pro Tag</div></div>
+      <div class="card kpi"><div class="titel">Gespräche</div><div class="wert">${zahl(g.gespraech)}</div>
+        <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">Quote ${prozent(g.quote)}</span>
+        ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}<span>Obergrenze</span></div></div>
+      <div class="card kpi"><div class="titel">Kontakte</div><div class="wert">${zahl(r.kontakte)}</div>
+        <div class="zusatz">verschiedene Personen</div></div>
+      <div class="card kpi"><div class="titel">Firmen</div><div class="wert">${zahl(r.firmen)}</div>
+        <div class="zusatz">verschiedene Unternehmen</div></div>`;
+
+    // Ergebnis-Aufteilung
+    const anteil = n => g.anrufe ? prozent(n / g.anrufe) : '–';
+    $('#ergebnis').innerHTML = `
+      <h2>Ergebnis der Anrufe</h2>
+      ${legende()}
+      <div data-tip="${esc(aufteilungText(g))}">${balken(g, g.anrufe, 'balken-gross')}</div>
+      <div class="aufteilung">
+        <div><div class="titel"><i class="farbe f-gespraech"></i>Gespräch</div>
+          <span class="zahl">${zahl(g.gespraech)}</span> <span class="anteil">${anteil(g.gespraech)}</span></div>
+        <div><div class="titel"><i class="farbe f-falsch"></i>Falscher Kontakt / abwesend</div>
+          <span class="zahl">${zahl(g.falsch)}</span> <span class="anteil">${anteil(g.falsch)}</span></div>
+        <div><div class="titel"><i class="farbe f-niemand"></i>Niemand erreicht</div>
+          <span class="zahl">${zahl(g.niemand)}</span> <span class="anteil">${anteil(g.niemand)}</span></div>
+      </div>
+      <p class="notiz-klein">„Gespräch“ ist eine Obergrenze: Gezählt wird jede Notiz, die keines der Stichwörter für
+        „niemand erreicht“ oder „falscher Kontakt“ enthält. Von Hand nachgezählt fällt der Wert niedriger aus.
+        Quoten aus weniger als ${MINDEST_STICHPROBE} Anrufen sind mit ⚠ markiert und nicht belastbar.</p>`;
+
+    // Leerer Zeitraum
+    const leer = g.anrufe === 0;
+    $('#auswertungen').hidden = leer;
+    $('#ergebnis').hidden = leer;
+    $('#leer').hidden = !leer;
+    if (leer) {
+      $('#leer').innerHTML = d.anrufe.length
+        ? `Keine Anrufe in diesem Zeitraum. Die Datei enthält Anrufe vom ${datumLang(erster)} bis ${datumLang(letzter)}.<br><br>
+           <button class="knopf" type="button" data-art="alles">Alles anzeigen</button>`
+        : 'Die Datei enthält keine Anrufe mit Notiz.';
+    }
+
+    // Pro Tag
+    $('#proTag').innerHTML = reihen(r.proTag.map(t => ({ label: tagKurz(t.tag), t })));
+
+    // Pro Wochentag: Montag bis Freitag immer, Wochenende nur mit Anrufen
+    $('#proWochentag').innerHTML = reihen(r.proWochentag
+      .filter((t, i) => i < 5 || t.anrufe > 0)
+      .map(t => ({ label: t.label, t })));
+
+    // Pro Stunde: von der ersten bis zur letzten Stunde mit Anrufen, Lücken sichtbar
+    const mitAnrufen = r.proStunde.filter(t => t.anrufe);
+    const ab = mitAnrufen[0]?.stunde ?? 0, bis = mitAnrufen[mitAnrufen.length - 1]?.stunde ?? -1;
+    $('#proStunde').innerHTML = reihen(r.proStunde.slice(ab, bis + 1)
+      .map(t => ({ label: `${String(t.stunde).padStart(2, '0')}–${String((t.stunde + 1) % 24).padStart(2, '0')} Uhr`, t })));
+    $('#stundeZusatz').textContent = `deutsche Zeit, Versatz ${versatzText(zustand.versatz)}`;
+
+    // Nummerntyp
+    $('#proNummer').innerHTML = reihen(r.proNummerTyp.filter(t => t.anrufe).map(t => ({ label: t.label, t })))
+      + `<p class="notiz-klein">Mobil = deutsche Nummer mit 015, 016 oder 017. Festnetz = andere deutsche Nummer.</p>`;
+
+    // Top-Firmen (ohne Quote: bei einzelnen Firmen fast immer zu wenig Anrufe)
+    const top = r.topFirmen.slice(0, 10);
+    const maxF = top[0]?.anrufe || 0;
+    $('#firmen').innerHTML = top.length ? `
+      <table class="tabelle firmen">
+        <thead><tr><th>Firma</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Kontakte</th><th class="mini">Ergebnis</th></tr></thead>
+        <tbody>${top.map(f => `<tr data-tip="${esc(f.name + '\n' + aufteilungText(f))}">
+          <td>${esc(f.name)}</td><td class="num">${zahl(f.anrufe)}</td><td class="num">${zahl(f.gespraech)}</td>
+          <td class="num">${zahl(f.kontakte)}</td><td class="mini">${balken(f, maxF)}</td></tr>`).join('')}</tbody>
+      </table>
+      ${r.topFirmen.length > 10 ? `<p class="notiz-klein">Die 10 meistangerufenen von ${zahl(r.topFirmen.length)} Firmen.</p>` : ''}`
+      : '<p class="notiz-klein">Keine Firmennamen im Zeitraum.</p>';
+
+    // Gespräche
+    $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
+    $('#gespraeche').innerHTML = r.gespraeche.length ? `
+      <table class="tabelle gespraeche">
+        <thead><tr><th>Zeitpunkt</th><th>Name</th><th>Firma</th><th>Notiz</th></tr></thead>
+        <tbody>${r.gespraeche.map(a => `<tr>
+          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}</td>
+          <td>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</td>
+          <td>${esc(a.firma || '–')}</td>
+          <td class="notiztext">${esc(a.notiz)}</td></tr>`).join('')}</tbody>
+      </table>` : '<p class="notiz-klein">Keine Gespräche im Zeitraum.</p>';
+
+    // Datenbasis
+    const s = d.stat;
+    const tz = { ';': 'Semikolon', ',': 'Komma', '\t': 'Tab' }[s.trennzeichen];
+    $('#fuss').textContent = `Datenbasis: ${zustand.dateiname} · ${zahl(s.datenzeilen)} Zeilen gelesen · ` +
+      `${zahl(s.keinAnruf)} ohne Notiz entfernt · ${zahl(s.dubletten)} Dubletten entfernt` +
+      (s.ohneDatum ? ` · ${zahl(s.ohneDatum)} ohne lesbares Datum entfernt` : '') +
+      ` · ${zahl(d.anrufe.length)} Anrufe insgesamt (${erster ? datumLang(erster) + ' – ' + datumLang(letzter) : '–'})` +
+      ` · Uhrzeiten mit Versatz ${versatzText(zustand.versatz)} · Trennzeichen ${tz}`;
+  }
+
+  /* ---------- Daten laden und rechnen ---------- */
+  function zeigeFehler(text) {
+    $('#fehler').textContent = text || '';
+    $('#fehler').hidden = !text;
+  }
+
+  function rechne() {
+    if (zustand.text == null) return;
+    try {
+      zustand.daten = leseAnrufe(zustand.text, zustand.versatz);
+      zeigeFehler('');
+    } catch (e) {
+      zustand.daten = null;
+      zeigeFehler('Die Datei konnte nicht ausgewertet werden.\n' + e.message);
+    }
+    zeichne();
+  }
+
+  function waehleZeitraum(art) {
+    zustand.art = art;
+    ({ von: zustand.von, bis: zustand.bis } = zeitraum(art, heuteIso()));
+    zeichne();
+  }
+
+  async function ladeDatei(datei) {
+    if (!datei) return;
+    const puffer = await datei.arrayBuffer();
+    let text;
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(puffer); }
+    catch { text = new TextDecoder('windows-1252').decode(puffer); }   // falls in Excel neu gespeichert
+    zustand.text = text;
+    zustand.dateiname = datei.name;
+    rechne();
+    if (zustand.daten && zustand.art !== 'eigen') waehleZeitraum(zustand.art);
+  }
+
+  /* ---------- Bedienung ---------- */
+  $$('[data-datei]').forEach(inp => inp.addEventListener('change', () => { ladeDatei(inp.files[0]); inp.value = ''; }));
+
+  let ziehTiefe = 0;
+  window.addEventListener('dragenter', e => { e.preventDefault(); ziehTiefe++; document.body.classList.add('zieht'); });
+  window.addEventListener('dragleave', () => { if (--ziehTiefe <= 0) { ziehTiefe = 0; document.body.classList.remove('zieht'); } });
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    ziehTiefe = 0;
+    document.body.classList.remove('zieht');
+    ladeDatei(e.dataTransfer.files[0]);
+  });
+
+  document.addEventListener('click', e => {
+    const b = e.target.closest('[data-art]');
+    if (b) waehleZeitraum(b.dataset.art);
+  });
+
+  for (const id of ['von', 'bis']) {
+    $('#' + id).addEventListener('change', () => {
+      zustand.art = 'eigen';
+      zustand.von = $('#von').value || null;
+      zustand.bis = $('#bis').value || null;
+      zeichne();
+    });
+  }
+
+  $('#versatz').addEventListener('input', () => {
+    const v = parseFloat($('#versatz').value);
+    if (!Number.isFinite(v)) return;
+    zustand.versatz = v;
+    speicher.set('adric.versatz', String(v));
+    rechne();
+  });
+
+  // Darstellung: Auto (folgt dem System) → Hell → Dunkel
+  const THEMEN = ['auto', 'light', 'dark'];
+  const THEMA_TEXT = { auto: 'Auto', light: 'Hell', dark: 'Dunkel' };
+  function setzeThema(t) {
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', t);
+    $('#thema').textContent = 'Darstellung: ' + THEMA_TEXT[t];
+    speicher.set('adric.thema', t);
+  }
+  let thema = THEMEN.includes(speicher.get('adric.thema')) ? speicher.get('adric.thema') : 'auto';
+  setzeThema(thema);
+  $('#thema').addEventListener('click', () => { thema = THEMEN[(THEMEN.indexOf(thema) + 1) % 3]; setzeThema(thema); });
+  $('#drucken').addEventListener('click', () => window.print());
+
+  // Tooltip für Balken und Tabellenzeilen
+  const tip = $('#tip');
+  document.addEventListener('mousemove', e => {
+    const ziel = e.target.closest('[data-tip]');
+    if (!ziel) { tip.hidden = true; return; }
+    tip.textContent = ziel.dataset.tip;
+    tip.hidden = false;
+    const r = tip.getBoundingClientRect();
+    let x = e.clientX + 14, y = e.clientY + 14;
+    if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14;
+    if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+    tip.style.left = Math.max(8, x) + 'px';
+    tip.style.top = Math.max(8, y) + 'px';
+  });
+  document.addEventListener('mouseleave', () => { tip.hidden = true; });
+
+  // Für die Fehlersuche in der Browser-Konsole: adricLadeText(text, 'name.csv')
+  window.adricLadeText = (text, name = 'eingefügt.csv') => {
+    zustand.text = text; zustand.dateiname = name; rechne();
+    if (zustand.daten) waehleZeitraum(zustand.art === 'eigen' ? 'woche' : zustand.art);
+  };
+
+  $('#versatz').value = zustand.versatz;
+  zeichne();
+})();
+</script>
+</body>
+</html>
