@@ -29,6 +29,10 @@ Jede Notiz wird anhand von Stichwörtern einer von drei Kategorien zugeordnet: *
 
 **„Gespräch“ ist eine Obergrenze.** Alles, was kein Stichwort trifft, zählt als Gespräch, auch „Rückruf morgen“ oder Tippfehler wie „Mailbx“. Von Hand nachgezählt fällt der Wert niedriger aus. Wer solche Notizen in der Gesprächstabelle findet, ergänzt einfach das passende Wort in der Liste.
 
+### Termin gebucht
+
+Ein Gespräch zählt zusätzlich als **Termin gebucht**, wenn die Notiz ein Wort aus `WOERTER_TERMIN_GEBUCHT` enthält, etwa „Termin vereinbart“, „Termin ausgemacht“ oder „call gebucht“, und keines aus `WOERTER_KEIN_TERMIN`, etwa „keinen Termin“, „nicht ausmachen“ oder „schon vereinbart“. In den Listen steht `…` für bis zu 40 Zeichen im selben Satz, „Termin am Freitag 10 Uhr vereinbart“ zählt also auch. Termine erscheinen als Kennzahl (mit Anteil an den Gesprächen), als Spalte pro Tag, Wochentag, Stunde und Firma und als eigene Liste „Gebuchte Termine“.
+
 ### Kleine Stichproben
 
 Jede Quote, die aus weniger als 10 Anrufen berechnet wird, trägt den Hinweis **⚠ Stichprobe zu klein (n)**. Bei den Top-Firmen wird deshalb gar keine Quote gezeigt, weil einzelne Firmen fast nie auf 10 Anrufe kommen. Die Grenze steht als `MINDEST_STICHPROBE` oben in `index.html`.

@@ -129,6 +129,51 @@ const TIPPFEHLER = {
   'nicth': 'nicht',
 };
 
+/* ---------------------------------------------------------------------
+   TERMIN GEBUCHT
+   Ein Gespräch zählt zusätzlich als "Termin gebucht", wenn die Notiz eines
+   der Wörter aus WOERTER_TERMIN_GEBUCHT enthält UND keines aus
+   WOERTER_KEIN_TERMIN. Geprüft wird nur bei Gesprächen: Steht "Mailbox" in
+   der Notiz, gibt es keinen Termin.
+
+   Das Zeichen … steht für "beliebige Wörter dazwischen, im selben Satz,
+   höchstens 40 Zeichen". 'termin … vereinbart' trifft also auch
+   "Termin am Freitag 10 Uhr vereinbart", aber nicht über einen Punkt hinweg.
+
+   Stand 01.10.2026: Im echten Export waren 2 Termine ("call gebucht",
+   "Termin ausgemacht"). Die Negativliste fängt die Fallen aus derselben Datei ab.
+   --------------------------------------------------------------------- */
+const WOERTER_TERMIN_GEBUCHT = [
+  'termin … vereinbart',
+  'termin … gebucht',
+  'termin … ausgemacht',
+  'termin … bestätigt',
+  'termin steht',
+  'meeting … vereinbart',
+  'meeting … gebucht',
+  'meeting … ausgemacht',
+  'call … gebucht',         // "hat … call gebucht"
+  'call … ausgemacht',
+  'demo … vereinbart',
+  'demo … gebucht',
+];
+
+// Steht eines davon in der Notiz, zählt sie NICHT als Termin.
+const WOERTER_KEIN_TERMIN = [
+  'kein termin',
+  'keinen termin',           // "wollte keinen Termin"
+  'kein meeting',
+  'keinen call',
+  'nicht ausmachen',         // "2. Termin konnte ich nicht ausmachen"
+  'nicht vereinbart',
+  'nicht gebucht',
+  'abgesagt',
+  'schon vereinbart',        // früher gebucht, nicht in diesem Anruf
+  'bereits vereinbart',
+  'schon gebucht',
+  'bereits gebucht',
+];
+
 // Notizen mit diesem Inhalt (oder leer) sind keine Anrufe und fliegen raus.
 // Auch in allen anderen Spalten wird "(Kein Wert)" als leer behandelt.
 const KEIN_WERT = '(kein wert)';
@@ -263,17 +308,29 @@ function htmlZuText(s) {
     .trim();
 }
 
-const _niemand = WOERTER_NIEMAND_ERREICHT.map(w => w.normalize('NFC').toLowerCase());
-const _falsch = WOERTER_FALSCHER_KONTAKT.map(w => w.normalize('NFC').toLowerCase());
+// Macht aus einem Listeneintrag eine Prüffunktion. Ohne … reicht ein
+// einfacher Teilwort-Treffer, mit … sind bis zu 40 Zeichen im selben Satz dazwischen erlaubt.
+function suchmuster(eintrag) {
+  const w = eintrag.normalize('NFC').toLowerCase();
+  if (!w.includes('…')) return { wort: w, trifft: t => t.includes(w) };
+  const teile = w.split('…').map(s => s.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const re = new RegExp(teile.join('[^.!?\\n]{0,40}?'));
+  return { wort: w, trifft: t => re.test(t) };
+}
+const _niemand = WOERTER_NIEMAND_ERREICHT.map(suchmuster);
+const _falsch = WOERTER_FALSCHER_KONTAKT.map(suchmuster);
+const _termin = WOERTER_TERMIN_GEBUCHT.map(suchmuster);
+const _keinTermin = WOERTER_KEIN_TERMIN.map(suchmuster);
 
 const _tippfehler = new RegExp(`(^|[^a-zäöüß])(${Object.keys(TIPPFEHLER).join('|')})(?![a-zäöüß])`, 'g');
 
 function klassifiziere(notiz) {
   const t = normalisiere(notiz).toLowerCase()
     .replace(_tippfehler, (_, davor, wort) => davor + TIPPFEHLER[wort]);
-  for (const w of _niemand) if (t.includes(w)) return { kategorie: 'niemand', treffer: w };
-  for (const w of _falsch) if (t.includes(w)) return { kategorie: 'falsch', treffer: w };
-  return { kategorie: 'gespraech', treffer: null };
+  for (const m of _niemand) if (m.trifft(t)) return { kategorie: 'niemand', treffer: m.wort, termin: false };
+  for (const m of _falsch) if (m.trifft(t)) return { kategorie: 'falsch', treffer: m.wort, termin: false };
+  const termin = _termin.some(m => m.trifft(t)) && !_keinTermin.some(m => m.trifft(t));
+  return { kategorie: 'gespraech', treffer: null, termin };
 }
 
 function nummernTyp(telefon) {
@@ -350,7 +407,7 @@ function leseAnrufe(text, versatzStunden) {
     if (!zeit) { stat.ohneDatum++; continue; }
 
     const telefon = hole(z, 'telefon');
-    const { kategorie, treffer } = klassifiziere(notiz);
+    const { kategorie, treffer, termin } = klassifiziere(notiz);
     anrufe.push({
       notiz, telefon, engagementId,
       firma: hole(z, 'firma'),
@@ -362,7 +419,7 @@ function leseAnrufe(text, versatzStunden) {
       wochentag: (zeit.getUTCDay() + 6) % 7,   // 0 = Montag
       stunde: zeit.getUTCHours(),
       nummerTyp: nummernTyp(telefon),
-      kategorie, treffer,
+      kategorie, treffer, termin,
     });
   }
   anrufe.sort((a, b) => a.zeit - b.zeit);
@@ -399,15 +456,19 @@ function zeitraum(art, heute) {
    ===================================================================== */
 
 function leererTopf() {
-  return { anrufe: 0, gespraech: 0, niemand: 0, falsch: 0 };
+  return { anrufe: 0, gespraech: 0, niemand: 0, falsch: 0, termin: 0 };
 }
 function zaehle(topf, a) {
   topf.anrufe++;
   topf[a.kategorie]++;
+  if (a.termin) topf.termin++;
 }
 function mitQuote(topf) {
   topf.quote = topf.anrufe ? topf.gespraech / topf.anrufe : null;
   topf.kleineStichprobe = topf.anrufe < MINDEST_STICHPROBE;
+  // Termine je Gespräch; die Basis sind hier die Gespräche, nicht die Anrufe
+  topf.terminQuote = topf.gespraech ? topf.termin / topf.gespraech : null;
+  topf.terminKleineStichprobe = topf.gespraech < MINDEST_STICHPROBE;
   return topf;
 }
 
@@ -463,6 +524,7 @@ function auswerten(alleAnrufe, von, bis) {
     proStunde: stunden.map((t, h) => Object.assign(mitQuote(t), { stunde: h })),
     proNummerTyp: Object.entries(nummern).map(([typ, t]) => Object.assign(mitQuote(t), { typ, label: NUMMERNTYPEN[typ] })),
     gespraeche: anrufe.filter(a => a.kategorie === 'gespraech'),
+    termine: anrufe.filter(a => a.termin),
     topFirmen,
   };
 }
@@ -575,7 +637,7 @@ input[type="number"] { width: 70px; }
 .hinweis-leer { text-align: center; padding: 32px 16px; color: var(--ink-2); }
 
 /* Kennzahlenband */
-.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+.kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 12px; }
 .kpi .titel { font-size: 13px; color: var(--ink-2); }
 .kpi .wert { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 34px; font-weight: 500; line-height: 1.15; margin: 4px 0 2px; }
 .kpi .zusatz { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
@@ -599,6 +661,11 @@ input[type="number"] { width: 70px; }
 .balken-gross { display: flex; gap: 2px; height: 22px; margin-top: 12px; }
 .balken-gross i { border-radius: 4px; }
 .notiz-klein { font-size: 12.5px; color: var(--muted); margin: 14px 0 0; }
+/* Markierung "Termin gebucht": Akzentfarbe, damit sie sich von den Ergebnisfarben abhebt */
+.termin-marke { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; line-height: 1.2; color: var(--accent);
+  border: 1px solid var(--accent); border-radius: 999px; padding: 2px 8px; white-space: nowrap; font-family: var(--sans); }
+.kpi.termin .wert { color: var(--accent); }
+.reihe .t.hat { color: var(--accent); font-weight: 500; }
 
 /* Raster der Auswertungen */
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
@@ -607,7 +674,7 @@ input[type="number"] { width: 70px; }
 
 /* Balkenzeilen: Bezeichnung | Balken | Anrufe | Quote | Hinweis */
 .reihen { font-size: 14px; }
-.reihe { display: grid; grid-template-columns: 136px minmax(60px, 1fr) 44px 52px 150px; grid-template-areas: "l b n q w";
+.reihe { display: grid; grid-template-columns: 136px minmax(60px, 1fr) 44px 58px 52px 150px; grid-template-areas: "l b n t q w";
   align-items: center; gap: 4px 10px; padding: 5px 4px; border-radius: 6px; }
 .reihe:hover { background: var(--accent-soft); }
 .reihe.kopfzeile { font-size: 12px; color: var(--muted); padding-top: 0; }
@@ -616,6 +683,7 @@ input[type="number"] { width: 70px; }
 .reihe .b { grid-area: b; }
 .reihe .n { grid-area: n; text-align: right; }
 .reihe .q { grid-area: q; text-align: right; }
+.reihe .t { grid-area: t; text-align: right; }
 .reihe .w { grid-area: w; }
 .reihe.leer .l, .reihe.leer .n { color: var(--muted); }
 .balken { display: flex; gap: 2px; height: 14px; }
@@ -639,11 +707,15 @@ input[type="number"] { width: 70px; }
   line-height: 1.4; padding: 6px 9px; border-radius: 6px; white-space: pre; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 /* Tablet und Handy */
+@media (max-width: 1000px) {
+  .kpis { grid-template-columns: repeat(3, 1fr); }
+}
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
   .kpis { grid-template-columns: repeat(2, 1fr); }
+  .kpis > :first-child { grid-column: 1 / -1; }
   .kpi .wert { font-size: 28px; }
   .datei { margin-left: 0; }
 }
@@ -656,7 +728,7 @@ input[type="number"] { width: 70px; }
   .seg button:nth-child(n+3) { border-bottom: 0; }
   input[type="date"] { width: 100%; }
   .kpi .wert { font-size: 26px; }
-  .reihe { grid-template-columns: 1fr 44px 52px; grid-template-areas: "l n q" "b b b" "w w w"; }
+  .reihe { grid-template-columns: 1fr 44px 58px 52px; grid-template-areas: "l n t q" "b b b b" "w w w w"; }
   .reihe .w:empty { display: none; }
   .reihe.kopfzeile .b, .reihe.kopfzeile .w { display: none; }
   .aufteilung { grid-template-columns: 1fr; gap: 6px; }
@@ -668,7 +740,8 @@ input[type="number"] { width: 70px; }
   .gespraeche td { display: block; border: 0; padding: 1px 0; }
   .gespraeche td.zeit { color: var(--muted); }
   .gespraeche td.notiztext { margin-top: 4px; }
-  .firmen .mini { display: none; }
+  .firmen .mini, .firmen .neben { display: none; }
+  .firmen td:first-child { overflow-wrap: anywhere; }
 }
 
 /* Druck / PDF: immer hell, ohne Bedienelemente */
@@ -737,6 +810,7 @@ input[type="number"] { width: 70px; }
       <section class="card"><h2>Anrufe und Quote pro Stunde <span class="h2-zusatz" id="stundeZusatz"></span></h2><div id="proStunde"></div></section>
       <section class="card"><h2>Erreichbarkeit nach Nummerntyp</h2><div id="proNummer"></div></section>
       <section class="card voll"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
+      <section class="card voll"><h2>Gebuchte Termine <span class="h2-zusatz" id="termineZusatz"></span></h2><div id="termine"></div></section>
       <section class="card voll"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
     </div>
     <p class="fuss" id="fuss"></p>
@@ -806,6 +880,7 @@ input[type="number"] { width: 70px; }
 
   function aufteilungText(t) {
     return `Gespräch           ${String(t.gespraech).padStart(4)}\n` +
+           `  davon Termin     ${String(t.termin).padStart(4)}\n` +
            `Falsch / abwesend  ${String(t.falsch).padStart(4)}\n` +
            `Niemand erreicht   ${String(t.niemand).padStart(4)}\n` +
            `Anrufe gesamt      ${String(t.anrufe).padStart(4)}` +
@@ -828,13 +903,14 @@ input[type="number"] { width: 70px; }
     if (!eintraege.length) return '<p class="notiz-klein">Keine Anrufe.</p>';
     const max = Math.max(...eintraege.map(e => e.t.anrufe));
     const kopf = `<div class="reihe kopfzeile"><span class="l"></span><span class="b"></span>
-      <span class="n">Anrufe</span><span class="q">Quote</span><span class="w"></span></div>`;
+      <span class="n">Anrufe</span><span class="t">Termine</span><span class="q">Quote</span><span class="w"></span></div>`;
     const zeilen = eintraege.map(({ label, t }) => {
       const unsicher = t.anrufe > 0 && t.kleineStichprobe;
       return `<div class="reihe${t.anrufe ? '' : ' leer'}" data-tip="${esc(label + '\n' + aufteilungText(t))}">
         <span class="l">${esc(label)}</span>
         <span class="b">${balken(t, max)}</span>
         <span class="n num">${zahl(t.anrufe)}</span>
+        <span class="t num${t.termin ? ' hat' : ''}">${t.termin ? zahl(t.termin) : '–'}</span>
         <span class="q num${unsicher ? ' quote-unsicher' : ''}">${t.anrufe ? prozent(t.quote) : '–'}</span>
         <span class="w">${unsicher ? kleinHinweis(t.anrufe) : ''}</span></div>`;
     }).join('');
@@ -869,6 +945,9 @@ input[type="number"] { width: 70px; }
       <div class="card kpi"><div class="titel">Gespräche</div><div class="wert">${zahl(g.gespraech)}</div>
         <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">Quote ${prozent(g.quote)}</span>
         ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}<span>Obergrenze</span></div></div>
+      <div class="card kpi termin"><div class="titel">Termine gebucht</div><div class="wert">${zahl(g.termin)}</div>
+        <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(g.terminQuote)} der Gespräche</span>
+        ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}</div></div>
       <div class="card kpi"><div class="titel">Kontakte</div><div class="wert">${zahl(r.kontakte)}</div>
         <div class="zusatz">verschiedene Personen</div></div>
       <div class="card kpi"><div class="titel">Firmen</div><div class="wert">${zahl(r.firmen)}</div>
@@ -882,7 +961,8 @@ input[type="number"] { width: 70px; }
       <div data-tip="${esc(aufteilungText(g))}">${balken(g, g.anrufe, 'balken-gross')}</div>
       <div class="aufteilung">
         <div><div class="titel"><i class="farbe f-gespraech"></i>Gespräch</div>
-          <span class="zahl">${zahl(g.gespraech)}</span> <span class="anteil">${anteil(g.gespraech)}</span></div>
+          <span class="zahl">${zahl(g.gespraech)}</span> <span class="anteil">${anteil(g.gespraech)}</span>
+          <span class="termin-marke">davon ${zahl(g.termin)} mit Termin</span></div>
         <div><div class="titel"><i class="farbe f-falsch"></i>Falscher Kontakt / abwesend</div>
           <span class="zahl">${zahl(g.falsch)}</span> <span class="anteil">${anteil(g.falsch)}</span></div>
         <div><div class="titel"><i class="farbe f-niemand"></i>Niemand erreicht</div>
@@ -890,7 +970,8 @@ input[type="number"] { width: 70px; }
       </div>
       <p class="notiz-klein">„Gespräch“ ist eine Obergrenze: Gezählt wird jede Notiz, die keines der Stichwörter für
         „niemand erreicht“ oder „falscher Kontakt“ enthält. Von Hand nachgezählt fällt der Wert niedriger aus.
-        Quoten aus weniger als ${MINDEST_STICHPROBE} Anrufen sind mit ⚠ markiert und nicht belastbar.</p>`;
+        „Termin gebucht“ wird über eigene Stichwörter erkannt, etwa „Termin vereinbart“ oder „call gebucht“.
+        Quoten aus weniger als ${MINDEST_STICHPROBE} Anrufen bzw. Gesprächen sind mit ⚠ markiert und nicht belastbar.</p>`;
 
     // Leerer Zeitraum
     const leer = g.anrufe === 0;
@@ -928,25 +1009,28 @@ input[type="number"] { width: 70px; }
     const maxF = top[0]?.anrufe || 0;
     $('#firmen').innerHTML = top.length ? `
       <table class="tabelle firmen">
-        <thead><tr><th>Firma</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Kontakte</th><th class="mini">Ergebnis</th></tr></thead>
+        <thead><tr><th>Firma</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Termine</th><th class="num neben">Kontakte</th><th class="mini">Ergebnis</th></tr></thead>
         <tbody>${top.map(f => `<tr data-tip="${esc(f.name + '\n' + aufteilungText(f))}">
           <td>${esc(f.name)}</td><td class="num">${zahl(f.anrufe)}</td><td class="num">${zahl(f.gespraech)}</td>
-          <td class="num">${zahl(f.kontakte)}</td><td class="mini">${balken(f, maxF)}</td></tr>`).join('')}</tbody>
+          <td class="num">${f.termin ? zahl(f.termin) : '–'}</td><td class="num neben">${zahl(f.kontakte)}</td><td class="mini">${balken(f, maxF)}</td></tr>`).join('')}</tbody>
       </table>
       ${r.topFirmen.length > 10 ? `<p class="notiz-klein">Die 10 meistangerufenen von ${zahl(r.topFirmen.length)} Firmen.</p>` : ''}`
       : '<p class="notiz-klein">Keine Firmennamen im Zeitraum.</p>';
 
-    // Gespräche
-    $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
-    $('#gespraeche').innerHTML = r.gespraeche.length ? `
+    // Gebuchte Termine und alle Gespräche
+    const tabelle = (liste, leerText) => liste.length ? `
       <table class="tabelle gespraeche">
         <thead><tr><th>Zeitpunkt</th><th>Name</th><th>Firma</th><th>Notiz</th></tr></thead>
-        <tbody>${r.gespraeche.map(a => `<tr>
-          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}</td>
+        <tbody>${liste.map(a => `<tr>
+          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin gebucht</span>' : ''}</td>
           <td>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</td>
           <td>${esc(a.firma || '–')}</td>
           <td class="notiztext">${esc(a.notiz)}</td></tr>`).join('')}</tbody>
-      </table>` : '<p class="notiz-klein">Keine Gespräche im Zeitraum.</p>';
+      </table>` : `<p class="notiz-klein">${leerText}</p>`;
+    $('#termineZusatz').textContent = `${zahl(r.termine.length)} im Zeitraum`;
+    $('#termine').innerHTML = tabelle(r.termine, 'Keine gebuchten Termine im Zeitraum.');
+    $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
+    $('#gespraeche').innerHTML = tabelle(r.gespraeche, 'Keine Gespräche im Zeitraum.');
 
     // Datenbasis
     const s = d.stat;

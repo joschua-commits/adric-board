@@ -65,6 +65,19 @@ test('Tippfehler und Ergänzungen aus dem echten Export', () => {
   assert.equal(k('Unternehmen Nichtrostend GmbH, gutes Gespräch'), 'gespraech');
   assert.equal(k('wollte aber keine nummer geben'), 'gespraech');
 });
+test('Termin gebucht: Treffer und Fallen aus dem echten Export', () => {
+  const t = s => A.klassifiziere(s).termin;
+  assert.equal(t('hat den pain mit manueller rechnungsprüfung call gebucht'), true);
+  assert.equal(t('Provisionsmodell erklärt, Termin ausgemacht'), true);
+  assert.equal(t('Sehr gutes Gespräch, Termin am Freitag 10 Uhr vereinbart'), true);   // Wörter dazwischen
+  // dürfen NICHT zählen
+  assert.equal(t('wollte keinen termin sondern erst unterlagen'), false);
+  assert.equal(t('2. termin konnte ich nicht ausmachen, da er aufgelegt hat'), false);
+  assert.equal(t('call wurde schon vereinbart'), false);
+  assert.equal(t('Zentrale: Aktuell in einem termin'), false);
+  assert.equal(t('Termin wäre schön. Verträge werden vereinbart'), false);              // nicht über den Punkt
+  assert.equal(t('Mailbox, Termin für Freitag vereinbart?'), false);                    // niemand erreicht gewinnt
+});
 test('Nummerntyp', () => {
   const f = A.nummernTyp;
   assert.equal(f('+49 151 2345678'), 'mobil');
@@ -135,6 +148,8 @@ test('Diese Woche: 15 Anrufe, 4 Gespräche, 13 Kontakte, 7 Firmen, 4 Tage', () =
   assert.deepEqual([g.anrufe, g.gespraech, g.niemand, g.falsch], [15, 4, 7, 4]);
   assert.deepEqual([woche.kontakte, woche.firmen, woche.telefontage], [13, 7, 4]);
   assert.equal(g.kleineStichprobe, false);
+  assert.deepEqual([g.termin, woche.termine.map(a => a.engagementId)], [1, ['1010']]);
+  assert.equal(g.terminKleineStichprobe, true);   // nur 4 Gespräche
 });
 test('Diese Woche: pro Tag', () => {
   assert.deepEqual(woche.proTag.map(t => [t.tag, t.anrufe, t.gespraech]), [
