@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Anruf-Wochenboard</title>
+<title>adric Anruf-Board</title>
 
 <!-- =====================================================================
      KERN: Konfiguration, CSV-Parser, Klassifikation, Kennzahlen.
@@ -206,6 +206,25 @@ const NUMMERNTYPEN = {
   keine:    'Keine Nummer',
 };
 const WOCHENTAGE = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+
+/* ---------------------------------------------------------------------
+   KI-KLASSIFIKATION (OpenAI, läuft lokal in tools/update.mjs)
+   Die KI ordnet jede Notiz einem dieser Ergebnisse zu. "gruppe" verbindet sie
+   mit den drei Grundkategorien oben, damit alle Auswertungen gleich bleiben.
+   Unterhalb von KI_MINDEST_SICHERHEIT gilt wieder die Stichwort-Regel.
+   --------------------------------------------------------------------- */
+const KI_ERGEBNISSE = {
+  gespraech:         { gruppe: 'gespraech', label: 'Gespräch' },
+  nicht_rangegangen: { gruppe: 'niemand',   label: 'Nicht rangegangen' },
+  mailbox:           { gruppe: 'niemand',   label: 'Mailbox' },
+  besetzt:           { gruppe: 'niemand',   label: 'Besetzt' },
+  nummer_ungueltig:  { gruppe: 'niemand',   label: 'Nummer ungültig' },
+  zentrale_blockt:   { gruppe: 'niemand',   label: 'Zentrale blockt' },
+  falscher_kontakt:  { gruppe: 'falsch',    label: 'Falscher Kontakt' },
+  abwesend:          { gruppe: 'falsch',    label: 'Abwesend' },
+};
+const KI_INTERESSE = { hoch: 'Hohes Interesse', mittel: 'Mittleres Interesse', keins: 'Kein Interesse', unklar: 'Unklar' };
+const KI_MINDEST_SICHERHEIT = 0.6;
 
 /* =====================================================================
    CSV-PARSER
@@ -410,6 +429,7 @@ function leseAnrufe(text, versatzStunden) {
     const { kategorie, treffer, termin } = klassifiziere(notiz);
     anrufe.push({
       notiz, telefon, engagementId,
+      datumRoh: hole(z, 'datum'),
       firma: hole(z, 'firma'),
       vorname: hole(z, 'vorname'),
       nachname: hole(z, 'nachname'),
@@ -479,8 +499,12 @@ function kontaktSchluessel(a) {
   return 'name:' + name + '|' + a.telefon.replace(/\D/g, '');
 }
 
-function auswerten(alleAnrufe, von, bis) {
-  const anrufe = alleAnrufe.filter(a => (!von || a.tag >= von) && (!bis || a.tag <= bis));
+// termineOhneAnruf: von Hand gepflegte Termine, die nicht aus einem Anruf kamen
+// ([{ datum: 'JJJJ-MM-TT', firma, name, notiz }]). Sie zählen bei den Terminen mit,
+// aber nicht in Gesprächsquoten oder im Trichter.
+function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
+  const imZeitraum = tag => (!von || tag >= von) && (!bis || tag <= bis);
+  const anrufe = alleAnrufe.filter(a => imZeitraum(a.tag));
 
   const gesamt = leererTopf();
   const kontakte = new Set();
@@ -489,9 +513,16 @@ function auswerten(alleAnrufe, von, bis) {
   const wochentage = WOCHENTAGE.map(() => leererTopf());
   const stunden = Array.from({ length: 24 }, () => leererTopf());
   const nummern = Object.fromEntries(Object.keys(NUMMERNTYPEN).map(k => [k, leererTopf()]));
+  const heat = WOCHENTAGE.map(() => Array.from({ length: 24 }, () => leererTopf()));
+  const details = {};
+  const interesse = {};
 
   for (const a of anrufe) {
     zaehle(gesamt, a);
+    zaehle(heat[a.wochentag][a.stunde], a);
+    const det = a.detail || a.kategorie;
+    details[det] = (details[det] || 0) + 1;
+    if (a.kategorie === 'gespraech' && a.interesse) interesse[a.interesse] = (interesse[a.interesse] || 0) + 1;
     const ks = kontaktSchluessel(a);
     if (ks) kontakte.add(ks);
     if (a.firma) {
@@ -525,8 +556,159 @@ function auswerten(alleAnrufe, von, bis) {
     proNummerTyp: Object.entries(nummern).map(([typ, t]) => Object.assign(mitQuote(t), { typ, label: NUMMERNTYPEN[typ] })),
     gespraeche: anrufe.filter(a => a.kategorie === 'gespraech'),
     termine: anrufe.filter(a => a.termin),
+    termineOhneAnruf: (termineOhneAnruf || []).filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.datum) && imZeitraum(t.datum)),
     topFirmen,
+    heat: heat.map(zeile => zeile.map(mitQuote)),
+    details,                       // Ergebnis -> Anzahl (KI-Ergebnis oder Regel-Gruppe)
+    interesse,                     // nur Gespräche mit KI-Einschätzung
+    kiAnzahl: anrufe.filter(a => a.quelle === 'ki').length,
+    unsicher: anrufe.filter(a => a.ki && a.quelle !== 'ki'),
+    uneinig: anrufe.filter(a => a.uneinig),
   };
+}
+
+/* =====================================================================
+   KI-ERGEBNISSE ÜBERNEHMEN
+   ki: { [schluessel]: { h, ergebnis, termin, interesse, schritt, sicherheit, begruendung } }
+   Ein Eintrag gilt nur, wenn der Notiz-Hash "h" noch zur Notiz passt.
+   ===================================================================== */
+
+// FNV-1a, 32 Bit – kein Sicherheitsmerkmal, nur Erkennung geänderter Notizen
+function notizHash(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+function kiSchluessel(a) {
+  return a.engagementId || `${a.datumRoh}|${notizHash(a.notiz)}`;
+}
+
+function wendeKiAn(anrufe, ki) {
+  for (const a of anrufe) {
+    a.regel = { kategorie: a.kategorie, termin: a.termin };
+    a.detail = a.kategorie;
+    a.quelle = 'regel';
+    const k = ki && ki[kiSchluessel(a)];
+    if (!k || k.h !== notizHash(a.notiz) || !KI_ERGEBNISSE[k.ergebnis]) { a.ki = null; continue; }
+    a.ki = k;
+    const gruppe = KI_ERGEBNISSE[k.ergebnis].gruppe;
+    a.uneinig = gruppe !== a.regel.kategorie || (gruppe === 'gespraech' && !!k.termin !== a.regel.termin);
+    if (k.sicherheit < KI_MINDEST_SICHERHEIT) continue;      // unsicher: Regel bleibt
+    a.quelle = 'ki';
+    a.kategorie = gruppe;
+    a.detail = k.ergebnis;
+    a.termin = gruppe === 'gespraech' && !!k.termin;
+    a.interesse = gruppe === 'gespraech' ? k.interesse : null;
+    a.schritt = k.schritt || '';
+  }
+  return anrufe;
+}
+
+// Korrekturen von Hand, z. B. wenn ein Termin erst nach dem Anruf per E-Mail zustande kam.
+// korrekturen: { termin: { [Engagement ID]: true | false }, firma: { [Engagement ID]: 'Name' } }
+// Termin gilt nach KI und Regeln; Firma füllt nur leere Firmennamen.
+function wendeKorrekturenAn(anrufe, korrekturen) {
+  const termin = (korrekturen && korrekturen.termin) || {};
+  const firma = (korrekturen && korrekturen.firma) || {};
+  for (const a of anrufe) {
+    if (firma[a.engagementId] && !a.firma) a.firma = String(firma[a.engagementId]);
+    if (!(a.engagementId in termin)) continue;
+    a.termin = !!termin[a.engagementId];
+    if (a.termin) a.kategorie = 'gespraech';
+    a.manuell = true;
+  }
+  return anrufe;
+}
+
+/* =====================================================================
+   ZIP (HubSpot liefert den Export als ZIP)
+   Nur Einträge ohne Pfad, höchstens 20 Stück, entpackt höchstens 200 MB.
+   ===================================================================== */
+async function entpackeZip(puffer) {
+  const b = new Uint8Array(puffer), v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let eocd = -1;
+  for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) if (v.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('Keine gültige ZIP-Datei.');
+  const anzahl = v.getUint16(eocd + 10, true);
+  if (anzahl > 20) throw new Error('ZIP enthält zu viele Dateien.');
+  let p = v.getUint32(eocd + 16, true), summe = 0;
+  const eintraege = [];
+  for (let n = 0; n < anzahl; n++) {
+    if (v.getUint32(p, true) !== 0x02014b50) throw new Error('ZIP-Verzeichnis beschädigt.');
+    const methode = v.getUint16(p + 10, true), gepackt = v.getUint32(p + 20, true), groesse = v.getUint32(p + 24, true);
+    const nl = v.getUint16(p + 28, true), xl = v.getUint16(p + 30, true), kl = v.getUint16(p + 32, true);
+    const lokal = v.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(b.subarray(p + 46, p + 46 + nl));
+    p += 46 + nl + xl + kl;
+    if (/[\/]|^\.\.?$/.test(name) || name.includes('..')) throw new Error('Unerlaubter Dateiname im ZIP: ' + name);
+    summe += groesse;
+    if (summe > 200e6) throw new Error('ZIP entpackt zu groß.');
+    const start = lokal + 30 + v.getUint16(lokal + 26, true) + v.getUint16(lokal + 28, true);
+    eintraege.push({ name, methode, groesse, daten: b.subarray(start, start + gepackt) });
+  }
+  return eintraege;
+}
+async function zipEintragLesen(e) {
+  if (e.methode === 0) return e.daten;
+  if (e.methode !== 8) throw new Error('Unbekannte ZIP-Kompression.');
+  const strom = new Blob([e.daten]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(strom).arrayBuffer());
+}
+function dekodiere(bytes) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { return new TextDecoder('windows-1252').decode(bytes); }
+}
+// Liefert den CSV-Text der Anrufnotizen aus ZIP- oder CSV-Bytes.
+async function anrufCsvAus(puffer, dateiname = '') {
+  const b = new Uint8Array(puffer);
+  const istZip = b[0] === 0x50 && b[1] === 0x4b;
+  if (!istZip) return { text: dekodiere(b), quelle: dateiname };
+  for (const e of await entpackeZip(puffer)) {
+    if (!/\.csv$/i.test(e.name)) continue;
+    const text = dekodiere(await zipEintragLesen(e));
+    const kopf = parseCSV(text.slice(0, 2000)).zeilen[0] || [];
+    if (!spaltenIndex(kopf).fehlend.length) return { text, quelle: `${dateiname} › ${e.name}` };
+  }
+  throw new Error('Im ZIP ist keine CSV mit den Spalten Anrufnotizen und Aktivitätsdatum.');
+}
+
+/* =====================================================================
+   VERSCHLÜSSELUNG der Online-Daten
+   AES-256-GCM, Schlüssel per PBKDF2-SHA256 aus dem Passwort.
+   ===================================================================== */
+const PBKDF2_RUNDEN = 600000;
+const b64 = u8 => btoa(String.fromCharCode(...u8));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+function b64Gross(u8) {          // für große Puffer ohne Stack-Überlauf
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function schluesselAusPasswort(passwort, salt, runden = PBKDF2_RUNDEN) {
+  const roh = await crypto.subtle.importKey('raw', new TextEncoder().encode(passwort), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: runden }, roh, 256);
+  return new Uint8Array(bits);
+}
+async function verschluessle(klartext, passwort, salt) {
+  const roh = await schluesselAusPasswort(passwort, salt);
+  const key = await crypto.subtle.importKey('raw', roh, 'AES-GCM', false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(klartext)));
+  return { v: 1, kdf: 'PBKDF2-SHA256', runden: PBKDF2_RUNDEN, salt: b64(salt), iv: b64(iv), daten: b64Gross(ct) };
+}
+// passwortOderSchluessel: Passwort (String) oder bereits abgeleiteter Schlüssel (Uint8Array)
+async function entschluessle(paket, passwortOderSchluessel) {
+  const roh = typeof passwortOderSchluessel === 'string'
+    ? await schluesselAusPasswort(passwortOderSchluessel, unb64(paket.salt), paket.runden)
+    : passwortOderSchluessel;
+  const key = await crypto.subtle.importKey('raw', roh, 'AES-GCM', false, ['decrypt']);
+  try {
+    const klar = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(paket.iv) }, key, unb64(paket.daten));
+    return { inhalt: JSON.parse(new TextDecoder().decode(klar)), schluessel: roh };
+  } catch {
+    throw new Error('Falsches Passwort.');
+  }
 }
 
 // Für Tests und Oberfläche gebündelt
@@ -534,226 +716,306 @@ const ADRIC = {
   STANDARD_STUNDENVERSATZ, MINDEST_STICHPROBE, KATEGORIEN, NUMMERNTYPEN, WOCHENTAGE,
   parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
   leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
+  KI_ERGEBNISSE, KI_INTERESSE, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
+  entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, entschluessle, b64, unb64,
 };
 </script>
 
-<!-- Schrift mit gleich breiten Ziffern. Ohne Internet greift die Systemschrift,
-     die Ziffern bleiben über font-variant-numeric trotzdem gleich breit. -->
+<!-- Eine Schrift mit gleich breiten Ziffern für alle Zahlen. Ohne Internet greift
+     die Systemschrift, font-variant-numeric hält die Ziffern trotzdem gleich breit. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
 
 <style>
-/* ---------- Farben: hell ---------- */
+/* ---------- Farben: dunkel ist Standard ---------- */
 :root {
-  --bg: #f4f4f1;
-  --card: #ffffff;
-  --ink: #141413;
-  --ink-2: #52514e;
-  --muted: #6f6e69;
-  --line: #e3e2dc;
-  --line-2: #cfcec6;
-  --accent: #2a78d6;
-  --accent-soft: rgba(42, 120, 214, 0.10);
+  --bg: #07070b;
+  --glow-1: rgba(139, 108, 255, 0.22);
+  --glow-2: rgba(34, 211, 238, 0.10);
+  --card: rgba(255, 255, 255, 0.035);
+  --card-solid: #12121a;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-2: rgba(255, 255, 255, 0.16);
+  --ink: #f5f5fa;
+  --ink-2: #b9b9cc;
+  --muted: #84849a;
+  --accent: #8b6cff;
+  --accent-2: #22d3ee;
+  --accent-soft: rgba(139, 108, 255, 0.16);
   --on-accent: #ffffff;
   /* Ergebnisfarben: Gespräch / falscher Kontakt / niemand erreicht */
-  --good: #0ca30c;
-  --warn: #fab219;
-  --bad: #d03b3b;
-  --good-ink: #006300;
-  --warn-ink: #7a5200;
-  --bad-ink: #a82525;
-  --tip-bg: #141413;
-  --tip-ink: #ffffff;
-  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --good: #22c55e;
+  --warn: #f5b83d;
+  --bad: #f43f5e;
+  --good-ink: #4ade80;
+  --warn-ink: #fbbf24;
+  --bad-ink: #fb7185;
+  --tip-bg: #f5f5fa;
+  --tip-ink: #0b0b12;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  color-scheme: light;
+  color-scheme: dark;
 }
-/* ---------- Farben: dunkel (System-Einstellung oder Umschalter) ---------- */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0d0d0d; --card: #1a1a19; --ink: #f4f4f1; --ink-2: #c3c2b7; --muted: #9a998f;
-    --line: #2c2c2a; --line-2: #42423f; --accent: #3987e5; --accent-soft: rgba(57, 135, 229, 0.16);
-    --on-accent: #ffffff; --good-ink: #3fc43f; --warn-ink: #fab219; --bad-ink: #f07a7a;
-    --tip-bg: #f4f4f1; --tip-ink: #141413; color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #0d0d0d; --card: #1a1a19; --ink: #f4f4f1; --ink-2: #c3c2b7; --muted: #9a998f;
-  --line: #2c2c2a; --line-2: #42423f; --accent: #3987e5; --accent-soft: rgba(57, 135, 229, 0.16);
-  --on-accent: #ffffff; --good-ink: #3fc43f; --warn-ink: #fab219; --bad-ink: #f07a7a;
-  --tip-bg: #f4f4f1; --tip-ink: #141413; color-scheme: dark;
+/* ---------- Farben: hell (Umschalter) ---------- */
+:root[data-theme="light"] {
+  --bg: #f4f4f9; --glow-1: rgba(106, 76, 245, 0.12); --glow-2: rgba(8, 145, 178, 0.08);
+  --card: #ffffff; --card-solid: #ffffff; --line: #e3e3ee; --line-2: #cfcfdd;
+  --ink: #0d0d14; --ink-2: #4a4a5c; --muted: #6b6b80;
+  --accent: #6a4cf5; --accent-2: #0891b2; --accent-soft: rgba(106, 76, 245, 0.10);
+  --good: #16a34a; --warn: #e5a00d; --bad: #e11d48;
+  --good-ink: #15803d; --warn-ink: #92600a; --bad-ink: #be123c;
+  --tip-bg: #0d0d14; --tip-ink: #ffffff; color-scheme: light;
 }
 
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 var(--sans); }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+body {
+  margin: 0; min-height: 100vh; color: var(--ink); font: 15px/1.5 var(--sans);
+  background:
+    radial-gradient(1100px 520px at 12% -8%, var(--glow-1), transparent 60%),
+    radial-gradient(900px 480px at 100% 0%, var(--glow-2), transparent 55%),
+    var(--bg);
+  background-attachment: fixed;
+}
+.wrap { max-width: 1240px; margin: 0 auto; padding: 24px 16px 64px; }
 [hidden] { display: none !important; }
-.zahl, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.num, .zahl { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 /* Kopf */
-.kopf { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-.sub { font-family: var(--mono); font-size: 13px; color: var(--ink-2); margin-top: 2px; }
-.kopf-knoepfe { display: flex; gap: 8px; }
+.kopf { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.marke { font-size: 13px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+h1 { margin: 2px 0 0; font-size: clamp(26px, 4vw, 40px); line-height: 1.05; font-weight: 800; letter-spacing: -0.03em;
+  background: linear-gradient(92deg, var(--ink) 30%, var(--accent) 70%, var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.sub { font-family: var(--mono); font-size: 13px; color: var(--ink-2); margin-top: 6px; }
+.kopf-knoepfe { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* Bausteine */
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
-h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
-h2 .h2-zusatz { font-weight: 400; font-size: 13px; color: var(--muted); }
-.knopf { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 7px;
-  border: 1px solid var(--accent); background: var(--accent); color: var(--on-accent); cursor: pointer; }
-.knopf.leise { background: transparent; color: var(--ink-2); border-color: var(--line-2); }
-.knopf:hover { filter: brightness(1.05); }
-.knopf.leise:hover { background: var(--accent-soft); filter: none; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 20px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+h2 { font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-2);
+  margin: 0 0 16px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+h2 .h2-zusatz { font-weight: 400; letter-spacing: 0; text-transform: none; font-size: 13px; color: var(--muted); }
+.knopf { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 14px; font-weight: 600; padding: 9px 14px; border-radius: 10px;
+  border: 0; background: linear-gradient(135deg, var(--accent), color-mix(in oklab, var(--accent) 60%, var(--accent-2))); color: var(--on-accent); cursor: pointer; }
+.knopf.leise { background: transparent; color: var(--ink-2); border: 1px solid var(--line-2); font-weight: 500; }
+.knopf.leise:hover { background: var(--accent-soft); color: var(--ink); }
+.knopf:hover { filter: brightness(1.08); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* Startfläche */
-.drop { border: 2px dashed var(--line-2); text-align: center; padding: 48px 16px; }
+/* Sperrbildschirm */
+.sperre { min-height: 70vh; display: grid; place-items: center; }
+.sperre .card { width: min(440px, 100%); text-align: center; padding: 36px 28px; }
+.schloss { width: 56px; height: 56px; margin: 0 auto 14px; border-radius: 16px; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 10px 40px var(--glow-1); }
+.sperre h3 { margin: 0 0 6px; font-size: 22px; }
+.sperre p { margin: 0 0 18px; color: var(--ink-2); font-size: 14px; }
+.sperre input[type="password"] { width: 100%; font: inherit; font-size: 16px; padding: 12px 14px; border-radius: 12px;
+  border: 1px solid var(--line-2); background: var(--card-solid); color: var(--ink); margin-bottom: 12px; }
+.sperre .zeile { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sperre label.merken { font-size: 13px; color: var(--ink-2); display: inline-flex; gap: 8px; align-items: center; }
+.sperre .meldung { color: var(--bad-ink); font-size: 13px; min-height: 20px; margin-top: 10px; }
+.sperre .alternative { margin-top: 18px; font-size: 12.5px; color: var(--muted); }
+
+/* Startfläche ohne Online-Daten */
+.drop { border: 2px dashed var(--line-2); text-align: center; padding: 56px 16px; }
 .drop p { margin: 6px 0; }
 .drop .muted { color: var(--muted); font-size: 13px; }
 .ziehen-overlay { position: fixed; inset: 0; display: none; place-items: center; background: var(--accent-soft);
-  border: 3px dashed var(--accent); font-size: 20px; font-weight: 600; color: var(--accent); z-index: 10; pointer-events: none; }
+  border: 3px dashed var(--accent); font-size: 22px; font-weight: 700; color: var(--ink); z-index: 10; pointer-events: none; backdrop-filter: blur(4px); }
 body.zieht .ziehen-overlay { display: grid; }
 
 /* Steuerung */
-.controls { display: flex; flex-wrap: wrap; gap: 14px 20px; align-items: flex-end; margin-bottom: 12px; }
-.feld { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
-.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
-.seg button { font: inherit; font-size: 14px; padding: 7px 12px; border: 0; border-right: 1px solid var(--line-2);
-  background: transparent; color: var(--ink-2); cursor: pointer; }
-.seg button:last-child { border-right: 0; }
-.seg button:hover { background: var(--accent-soft); }
-.seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
-input[type="date"], input[type="number"] { font-family: var(--mono); font-size: 14px; padding: 6px 8px; border: 1px solid var(--line-2);
-  border-radius: 7px; background: var(--card); color: var(--ink); min-height: 35px; }
-input[type="number"] { width: 70px; }
-.einheit { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 14px; }
-.datei { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--ink-2); flex-wrap: wrap; }
+.controls { position: sticky; top: 8px; z-index: 5; display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: flex-end;
+  margin-bottom: 16px; padding: 14px 16px; background: color-mix(in oklab, var(--card-solid) 82%, transparent); }
+.feld { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.seg { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 4px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); }
+.seg button { font: inherit; font-size: 13.5px; padding: 6px 12px; border: 0; border-radius: 9px; background: transparent; color: var(--ink-2); cursor: pointer; }
+.seg button:hover { color: var(--ink); background: var(--accent-soft); }
+.seg button[aria-pressed="true"] { background: linear-gradient(135deg, var(--accent), color-mix(in oklab, var(--accent) 60%, var(--accent-2))); color: #fff; }
+input[type="date"], input[type="number"] { font-family: var(--mono); font-size: 13.5px; padding: 6px 8px; border: 1px solid var(--line-2);
+  border-radius: 9px; background: var(--card-solid); color: var(--ink); min-height: 34px; }
+input[type="number"] { width: 64px; }
+.einheit { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; text-transform: none; letter-spacing: 0; }
+.datei { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--ink-2); flex-wrap: wrap; }
+.quelle-punkt { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 12px var(--good); display: inline-block; }
 
-.fehler { border: 1px solid var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--card)); color: var(--bad-ink);
-  border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; white-space: pre-wrap; }
-.hinweis-leer { text-align: center; padding: 32px 16px; color: var(--ink-2); }
+.fehler { border: 1px solid var(--bad); background: color-mix(in oklab, var(--bad) 12%, transparent); color: var(--bad-ink);
+  border-radius: 14px; padding: 12px 16px; margin-bottom: 12px; white-space: pre-wrap; }
+.hinweis-leer { text-align: center; padding: 40px 16px; color: var(--ink-2); }
 
-/* Kennzahlenband */
-.kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 12px; }
-.kpi .titel { font-size: 13px; color: var(--ink-2); }
-.kpi .wert { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 34px; font-weight: 500; line-height: 1.15; margin: 4px 0 2px; }
-.kpi .zusatz { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+/* Hero */
+.hero { display: grid; grid-template-columns: 1.35fr repeat(2, 1fr); grid-template-rows: auto auto; gap: 14px; margin-bottom: 14px; }
+.hero .gross { grid-row: span 2; position: relative; overflow: hidden;
+  background: linear-gradient(150deg, color-mix(in oklab, var(--accent) 26%, var(--card-solid)), var(--card-solid) 70%); border-color: color-mix(in oklab, var(--accent) 40%, transparent); }
+.hero .gross::after { content: ""; position: absolute; right: -80px; bottom: -80px; width: 260px; height: 260px; border-radius: 50%;
+  background: radial-gradient(circle, var(--glow-1), transparent 70%); pointer-events: none; }
+.kpi .titel { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-2); font-weight: 600; }
+.kpi .wert { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 800; font-size: clamp(34px, 4.4vw, 52px);
+  line-height: 1; margin: 10px 0 8px; letter-spacing: -0.04em; }
+.hero .gross .wert { font-size: clamp(72px, 11vw, 140px); background: linear-gradient(180deg, var(--ink), color-mix(in oklab, var(--ink) 55%, var(--accent)));
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.kpi .zusatz { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.delta { font-family: var(--mono); font-size: 12.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+.delta.hoch { color: var(--good-ink); } .delta.runter { color: var(--bad-ink); } .delta.gleich { color: var(--muted); }
 
-/* Hinweis kleine Stichprobe: bewusst neutral, damit er nicht mit den Ergebnisfarben verwechselt wird */
+/* Hinweis kleine Stichprobe: neutral, damit er nicht mit den Ergebnisfarben verwechselt wird */
 .klein { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; line-height: 1.2; color: var(--ink-2);
-  border: 1px solid var(--line-2); border-radius: 999px; padding: 2px 8px; white-space: nowrap; font-family: var(--sans); }
+  border: 1px dashed var(--line-2); border-radius: 999px; padding: 2px 8px; white-space: nowrap; font-family: var(--sans); }
 .quote-unsicher { color: var(--muted); }
+.termin-marke { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; line-height: 1.2; color: #fff; font-weight: 600;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius: 999px; padding: 3px 9px; white-space: nowrap; font-family: var(--sans); }
+.chip { display: inline-flex; font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--ink-2); white-space: nowrap; }
+.chip.hoch { color: var(--good-ink); border-color: color-mix(in oklab, var(--good) 50%, transparent); }
+.chip.mittel { color: var(--warn-ink); border-color: color-mix(in oklab, var(--warn) 50%, transparent); }
 
-/* Ergebnis-Aufteilung */
-.legende { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--ink-2); }
+/* Raster */
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+.grid > *, .hero > * { min-width: 0; }
+.voll { grid-column: 1 / -1; }
+.notiz-klein { font-size: 12.5px; color: var(--muted); margin: 14px 0 0; }
+
+/* Trichter */
+.stufe { display: grid; grid-template-columns: 150px 1fr 70px 120px; gap: 12px; align-items: center; padding: 7px 0; }
+.stufe .l { font-weight: 600; }
+.stufe .spur { height: 30px; border-radius: 9px; background: var(--card); border: 1px solid var(--line); overflow: hidden; }
+.stufe .fuell { height: 100%; border-radius: 8px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.stufe .n { text-align: right; font-size: 18px; font-weight: 800; }
+.stufe .r { font-size: 12.5px; color: var(--muted); }
+
+/* Ergebnis-Verteilung und Balkenzeilen */
+.legende { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 10px; }
 .legende span { display: inline-flex; align-items: center; gap: 6px; }
 .farbe { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
-.f-gespraech { background: var(--good); }
-.f-falsch { background: var(--warn); }
-.f-niemand { background: var(--bad); }
-.aufteilung { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
-.aufteilung .titel { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
-.aufteilung .zahl { font-size: 22px; }
-.aufteilung .anteil { color: var(--muted); font-family: var(--mono); font-size: 13px; }
-.balken-gross { display: flex; gap: 2px; height: 22px; margin-top: 12px; }
-.balken-gross i { border-radius: 4px; }
-.notiz-klein { font-size: 12.5px; color: var(--muted); margin: 14px 0 0; }
-/* Markierung "Termin gebucht": Akzentfarbe, damit sie sich von den Ergebnisfarben abhebt */
-.termin-marke { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; line-height: 1.2; color: var(--accent);
-  border: 1px solid var(--accent); border-radius: 999px; padding: 2px 8px; white-space: nowrap; font-family: var(--sans); }
-.kpi.termin .wert { color: var(--accent); }
-.reihe .t.hat { color: var(--accent); font-weight: 500; }
-
-/* Raster der Auswertungen */
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
-.grid > *, .kpis > * { min-width: 0; }
-.voll { grid-column: 1 / -1; }
-
-/* Balkenzeilen: Bezeichnung | Balken | Anrufe | Quote | Hinweis */
+.f-gespraech { background: var(--good); } .f-falsch { background: var(--warn); } .f-niemand { background: var(--bad); }
+.balken-gross { display: flex; gap: 3px; height: 16px; margin: 4px 0 14px; }
+.balken-gross i { border-radius: 5px; }
 .reihen { font-size: 14px; }
 .reihe { display: grid; grid-template-columns: 136px minmax(60px, 1fr) 44px 58px 52px 150px; grid-template-areas: "l b n t q w";
-  align-items: center; gap: 4px 10px; padding: 5px 4px; border-radius: 6px; }
+  align-items: center; gap: 4px 10px; padding: 5px 6px; border-radius: 9px; }
 .reihe:hover { background: var(--accent-soft); }
-.reihe.kopfzeile { font-size: 12px; color: var(--muted); padding-top: 0; }
+.reihe.kopfzeile { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding-top: 0; }
 .reihe.kopfzeile:hover { background: none; }
 .reihe .l { grid-area: l; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.reihe .b { grid-area: b; }
-.reihe .n { grid-area: n; text-align: right; }
-.reihe .q { grid-area: q; text-align: right; }
-.reihe .t { grid-area: t; text-align: right; }
-.reihe .w { grid-area: w; }
+.reihe .b { grid-area: b; } .reihe .n { grid-area: n; text-align: right; } .reihe .q { grid-area: q; text-align: right; }
+.reihe .t { grid-area: t; text-align: right; } .reihe .w { grid-area: w; }
+.reihe .t.hat { color: var(--accent); font-weight: 800; }
 .reihe.leer .l, .reihe.leer .n { color: var(--muted); }
-.balken { display: flex; gap: 2px; height: 14px; }
-.balken i, .balken-gross i { display: block; min-width: 3px; }
-.balken i { border-radius: 3px; }
+.balken { display: flex; gap: 2px; height: 12px; }
+.balken i, .balken-gross i { display: block; min-width: 3px; transform-origin: left; animation: wachsen .7s cubic-bezier(.2, .8, .2, 1) both; }
+.balken i { border-radius: 4px; }
+@keyframes wachsen { from { transform: scaleX(0); } }
+.vert { display: grid; grid-template-columns: 170px 1fr 44px 50px; gap: 6px 12px; align-items: center; font-size: 14px; padding: 4px 0; }
+.vert .spur { height: 12px; }
+.vert .spur i { display: block; height: 100%; border-radius: 4px; transform-origin: left; animation: wachsen .7s cubic-bezier(.2, .8, .2, 1) both; }
+.vert .n, .vert .p { text-align: right; } .vert .p { color: var(--muted); font-size: 12.5px; }
+
+/* Heatmap */
+.heat-scroll { overflow-x: auto; }
+.heat { display: grid; gap: 4px; min-width: 520px; }
+.heat .kopf-h { font-size: 11px; color: var(--muted); text-align: center; font-family: var(--mono); }
+.heat .tag { font-size: 12.5px; color: var(--ink-2); align-self: center; }
+.zelle { border-radius: 9px; min-height: 52px; display: grid; place-content: center; text-align: center; border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--accent) var(--st, 0%), var(--card-solid)); }
+.zelle .q { font-family: var(--mono); font-weight: 800; font-size: 15px; line-height: 1.1; }
+.zelle .n { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); }
+.zelle.leer { background: transparent; border-style: dashed; }
+.zelle.dünn { background-image: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in oklab, var(--ink) 9%, transparent) 6px 7px);
+  background-color: color-mix(in oklab, var(--accent) var(--st, 0%), var(--card-solid)); }
+.zelle.dünn .q { color: var(--ink-2); }
+.heat-legende { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 12px; color: var(--muted); margin-top: 12px; }
+.heat-legende .verlauf { width: 120px; height: 10px; border-radius: 5px; background: linear-gradient(90deg, var(--card-solid), var(--accent)); border: 1px solid var(--line); }
+.heat-legende .muster { width: 18px; height: 12px; border-radius: 3px; border: 1px solid var(--line-2);
+  background: repeating-linear-gradient(135deg, transparent 0 4px, color-mix(in oklab, var(--ink) 25%, transparent) 4px 5px); }
+
+/* Termin-Karten */
+.termine { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.termin { border-radius: 16px; padding: 16px; border: 1px solid color-mix(in oklab, var(--accent) 45%, transparent);
+  background: linear-gradient(160deg, color-mix(in oklab, var(--accent) 18%, var(--card-solid)), var(--card-solid)); }
+.termin .wann { font-family: var(--mono); font-size: 13px; color: var(--ink-2); }
+.termin .wer { font-size: 18px; font-weight: 700; margin-top: 6px; }
+.termin .firma { color: var(--ink-2); font-size: 14px; }
+.termin .notiz { font-size: 13px; color: var(--muted); margin-top: 10px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; }
+.termin .schritt { margin-top: 10px; }
 
 /* Tabellen */
 .tabelle { width: 100%; border-collapse: collapse; font-size: 14px; }
-.tabelle th { text-align: left; font-weight: 500; font-size: 12px; color: var(--muted); padding: 0 12px 6px 0; border-bottom: 1px solid var(--line); }
-.tabelle td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tabelle th { text-align: left; font-weight: 600; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 0 12px 8px 0; border-bottom: 1px solid var(--line); }
+.tabelle td { padding: 11px 12px 11px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 .tabelle tr:last-child td { border-bottom: 0; }
 .tabelle .num { text-align: right; white-space: nowrap; }
 .tabelle th.num { font-family: var(--sans); }
 .tabelle .notiztext { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tabelle .zeit { white-space: nowrap; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; }
-.tabelle .mini { width: 30%; min-width: 90px; }
-.fuss { font-size: 12.5px; color: var(--muted); margin: 16px 0 0; }
+.tabelle .mini { width: 26%; min-width: 90px; }
+.tabelle .klein-text { font-size: 12.5px; color: var(--muted); }
+details.uneinig summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+details.uneinig summary::-webkit-details-marker { display: none; }
+details.uneinig summary h2 { margin: 0; }
+details.uneinig[open] summary { margin-bottom: 14px; }
+.pfeil { font-family: var(--mono); color: var(--muted); }
+.fuss { font-size: 12px; color: var(--muted); margin: 20px 0 0; }
+
+/* Klickbare Flächen und Detail-Liste */
+[data-liste] { cursor: pointer; }
+.kpi[data-liste] { transition: transform .15s, border-color .15s; }
+.kpi[data-liste]:hover { transform: translateY(-2px); border-color: var(--accent); }
+.stufe[data-liste]:hover .l, .vert[data-liste]:hover span:first-child { color: var(--accent); }
+.kpi .mehr { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+dialog.liste { width: min(980px, calc(100vw - 32px)); max-height: 86vh; padding: 0; border: 1px solid var(--line-2); border-radius: 18px;
+  background: var(--card-solid); color: var(--ink); }
+dialog.liste::backdrop { background: rgba(5, 5, 10, .6); backdrop-filter: blur(4px); }
+dialog.liste .kopfzeile { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 16px 20px; background: var(--card-solid); border-bottom: 1px solid var(--line); }
+dialog.liste .kopfzeile h3 { margin: 0; font-size: 18px; }
+dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(86vh - 70px); }
 
 /* Tooltip */
 .tip { position: fixed; z-index: 20; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font-size: 12.5px;
-  line-height: 1.4; padding: 6px 9px; border-radius: 6px; white-space: pre; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  line-height: 1.45; padding: 7px 10px; border-radius: 9px; white-space: pre; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
+
+/* Einblenden */
+.auftritt { animation: auftritt .6s cubic-bezier(.2, .8, .2, 1) both; }
+@keyframes auftritt { from { opacity: 0; transform: translateY(10px); } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
 
 /* Tablet und Handy */
 @media (max-width: 1000px) {
-  .kpis { grid-template-columns: repeat(3, 1fr); }
+  .hero { grid-template-columns: 1fr 1fr; }
+  .hero .gross { grid-column: 1 / -1; grid-row: auto; }
 }
-@media (max-width: 900px) {
-  .grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 760px) {
-  .kpis { grid-template-columns: repeat(2, 1fr); }
-  .kpis > :first-child { grid-column: 1 / -1; }
-  .kpi .wert { font-size: 28px; }
-  .datei { margin-left: 0; }
-}
-@media (max-width: 560px) {
-  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 640px) {
+  .controls { position: static; display: grid; grid-template-columns: 1fr 1fr; }
   .controls > .feld:first-child, .controls .datei, .controls > .feld:nth-child(4) { grid-column: 1 / -1; }
-  .seg { display: grid; grid-template-columns: 1fr 1fr; }
-  .seg button { border-right: 0; border-bottom: 1px solid var(--line-2); }
-  .seg button:nth-child(odd) { border-right: 1px solid var(--line-2); }
-  .seg button:nth-child(n+3) { border-bottom: 0; }
+  .datei { margin-left: 0; }
   input[type="date"] { width: 100%; }
-  .kpi .wert { font-size: 26px; }
+  .stufe { grid-template-columns: 1fr 60px; grid-template-areas: "l n" "s s" "r r"; }
+  .stufe .l { grid-area: l; } .stufe .n { grid-area: n; } .stufe .spur { grid-area: s; } .stufe .r { grid-area: r; }
+  .vert { grid-template-columns: 1fr 44px 50px; } .vert .spur { grid-column: 1 / -1; grid-row: 2; }
   .reihe { grid-template-columns: 1fr 44px 58px 52px; grid-template-areas: "l n t q" "b b b b" "w w w w"; }
   .reihe .w:empty { display: none; }
   .reihe.kopfzeile .b, .reihe.kopfzeile .w { display: none; }
-  .aufteilung { grid-template-columns: 1fr; gap: 6px; }
-  .aufteilung > div { display: flex; align-items: baseline; gap: 10px; }
-  .aufteilung .zahl { font-size: 18px; margin-left: auto; }
   .gespraeche thead { display: none; }
-  .gespraeche tr { display: block; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .gespraeche tr { display: block; padding: 12px 0; border-bottom: 1px solid var(--line); }
   .gespraeche tr:last-child { border-bottom: 0; }
-  .gespraeche td { display: block; border: 0; padding: 1px 0; }
-  .gespraeche td.zeit { color: var(--muted); }
-  .gespraeche td.notiztext { margin-top: 4px; }
+  .gespraeche td { display: block; border: 0; padding: 2px 0; }
   .firmen .mini, .firmen .neben { display: none; }
   .firmen td:first-child { overflow-wrap: anywhere; }
 }
 
 /* Druck / PDF: immer hell, ohne Bedienelemente */
 @media print {
-  :root:root:root {
-    --bg: #ffffff; --card: #ffffff; --ink: #141413; --ink-2: #52514e; --muted: #6f6e69; --line: #e3e2dc; --line-2: #cfcec6;
-    --good-ink: #006300; --warn-ink: #7a5200; --bad-ink: #a82525; color-scheme: light;
-  }
-  .no-print, #start, .tip { display: none !important; }
+  :root:root:root { --bg: #fff; --card: #fff; --card-solid: #fff; --ink: #0d0d14; --ink-2: #4a4a5c; --muted: #6b6b80; --line: #e3e3ee; --line-2: #cfcfdd;
+    --glow-1: transparent; --glow-2: transparent; color-scheme: light; }
+  body { background: #fff; }
+  .no-print, #start, #sperre, .tip { display: none !important; }
   .wrap { max-width: none; padding: 0; }
-  .card { break-inside: avoid; }
-  .reihe:hover { background: none; }
+  .card { break-inside: avoid; backdrop-filter: none; }
+  h1 { color: #0d0d14; background: none; }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
 </style>
@@ -762,20 +1024,38 @@ input[type="number"] { width: 70px; }
 <div class="wrap">
   <header class="kopf">
     <div>
-      <h1>Anruf-Wochenboard</h1>
-      <div class="sub" id="zeitraumText">HubSpot-Anrufnotizen auswerten</div>
+      <div class="marke">adric · Kaltakquise</div>
+      <h1>Anruf-Board</h1>
+      <div class="sub" id="zeitraumText">HubSpot-Anrufnotizen</div>
     </div>
     <div class="kopf-knoepfe no-print">
       <button class="knopf leise" id="drucken" type="button" hidden>Drucken / PDF</button>
-      <button class="knopf leise" id="thema" type="button">Darstellung: Auto</button>
+      <button class="knopf leise" id="sperren" type="button" hidden>Sperren</button>
+      <button class="knopf leise" id="thema" type="button">Hell</button>
     </div>
   </header>
 
-  <section id="start" class="card drop">
-    <p><strong>CSV-Datei hier hineinziehen</strong></p>
-    <p>oder <label class="knopf">Datei auswählen<input type="file" accept=".csv,text/csv,text/plain" hidden data-datei></label></p>
-    <p class="muted">HubSpot-Export „Anrufsnotizen“, Semikolon oder Komma getrennt.<br>
-      Die Datei wird nur in diesem Browser gelesen und nirgendwohin hochgeladen.</p>
+  <section id="sperre" class="sperre" hidden>
+    <form class="card auftritt" id="sperrForm" autocomplete="off">
+      <div class="schloss" aria-hidden="true">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+      </div>
+      <h3>Geschützte Anrufdaten</h3>
+      <p>Die Daten sind verschlüsselt und werden erst in deinem Browser entschlüsselt.</p>
+      <input type="password" id="passwort" placeholder="Passwort" aria-label="Passwort" autocomplete="current-password" required>
+      <div class="zeile">
+        <label class="merken"><input type="checkbox" id="merken"> Auf diesem Gerät merken</label>
+        <button class="knopf" type="submit" id="entsperren">Entsperren</button>
+      </div>
+      <div class="meldung" id="sperrMeldung" role="alert"></div>
+      <div class="alternative">Oder eine eigene CSV/ZIP hineinziehen – sie bleibt nur in diesem Browser.</div>
+    </form>
+  </section>
+
+  <section id="start" class="card drop" hidden>
+    <p><strong>HubSpot-Export hier hineinziehen</strong></p>
+    <p>oder <label class="knopf">Datei auswählen<input type="file" accept=".csv,.zip,text/csv,application/zip" hidden data-datei></label></p>
+    <p class="muted">ZIP oder CSV „Anrufsnotizen“. Die Datei wird nur in diesem Browser gelesen.</p>
   </section>
 
   <section id="steuerung" class="card controls no-print" hidden>
@@ -783,40 +1063,49 @@ input[type="number"] { width: 70px; }
       <div class="seg" role="group" aria-label="Zeitraum">
         <button type="button" data-art="woche">Diese Woche</button>
         <button type="button" data-art="letzteWoche">Letzte Woche</button>
-        <button type="button" data-art="30tage">Letzte 30 Tage</button>
+        <button type="button" data-art="30tage">30 Tage</button>
         <button type="button" data-art="alles">Alles</button>
       </div>
     </div>
     <label class="feld">Von<input type="date" id="von"></label>
     <label class="feld">Bis<input type="date" id="bis"></label>
-    <label class="feld">Stundenversatz
-      <span class="einheit"><input type="number" id="versatz" step="1" min="-14" max="14"> Stunden</span>
+    <label class="feld">Versatz
+      <span class="einheit"><input type="number" id="versatz" step="1" min="-14" max="14"> Std.</span>
     </label>
     <div class="datei">
-      <span id="dateiname"></span>
-      <label class="knopf leise">Andere Datei<input type="file" accept=".csv,text/csv,text/plain" hidden data-datei></label>
+      <span class="quelle-punkt" aria-hidden="true"></span><span id="dateiname"></span>
+      <label class="knopf leise">Andere Datei<input type="file" accept=".csv,.zip,text/csv,application/zip" hidden data-datei></label>
     </div>
   </section>
 
   <div id="fehler" class="fehler" role="alert" hidden></div>
 
   <main id="board" hidden>
-    <section class="kpis" id="kpis"></section>
-    <section class="card" id="ergebnis"></section>
+    <section class="hero" id="hero"></section>
     <section class="card hinweis-leer" id="leer" hidden></section>
-    <div class="grid" id="auswertungen">
-      <section class="card"><h2>Anrufe und Quote pro Tag</h2><div id="proTag"></div></section>
-      <section class="card"><h2>Anrufe und Quote pro Wochentag</h2><div id="proWochentag"></div></section>
-      <section class="card"><h2>Anrufe und Quote pro Stunde <span class="h2-zusatz" id="stundeZusatz"></span></h2><div id="proStunde"></div></section>
-      <section class="card"><h2>Erreichbarkeit nach Nummerntyp</h2><div id="proNummer"></div></section>
-      <section class="card voll"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
-      <section class="card voll"><h2>Gebuchte Termine <span class="h2-zusatz" id="termineZusatz"></span></h2><div id="termine"></div></section>
-      <section class="card voll"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
+    <div id="auswertungen">
+      <div class="grid">
+        <section class="card auftritt"><h2>Trichter <span class="h2-zusatz">vom Wählen bis zum Termin</span></h2><div id="trichter"></div></section>
+        <section class="card auftritt"><h2>Ergebnis der Anrufe <span class="h2-zusatz" id="ergebnisZusatz"></span></h2><div id="ergebnis"></div></section>
+        <section class="card voll auftritt"><h2>Wann erreicht man wen? <span class="h2-zusatz" id="heatZusatz"></span></h2><div id="heat"></div></section>
+        <section class="card voll auftritt"><h2>Gebuchte Termine <span class="h2-zusatz" id="termineZusatz"></span></h2><div id="termine"></div></section>
+        <section class="card auftritt"><h2>Pro Tag</h2><div id="proTag"></div></section>
+        <section class="card auftritt"><h2>Nach Nummerntyp</h2><div id="proNummer"></div></section>
+        <section class="card auftritt"><h2>Pro Wochentag</h2><div id="proWochentag"></div></section>
+        <section class="card auftritt"><h2>Pro Stunde <span class="h2-zusatz" id="stundeZusatz"></span></h2><div id="proStunde"></div></section>
+        <section class="card voll auftritt" id="uneinigKarte"></section>
+        <section class="card voll auftritt"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
+        <section class="card voll auftritt"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
+      </div>
     </div>
     <p class="fuss" id="fuss"></p>
   </main>
 </div>
 <div class="ziehen-overlay" aria-hidden="true">Datei loslassen</div>
+<dialog class="liste" id="liste" aria-labelledby="listeTitel">
+  <div class="kopfzeile"><h3 id="listeTitel"></h3><button class="knopf leise" type="button" id="listeZu">Schließen</button></div>
+  <div class="inhalt" id="listeInhalt"></div>
+</dialog>
 <div class="tip" id="tip" hidden></div>
 
 <!-- =====================================================================
@@ -829,23 +1118,20 @@ input[type="number"] { width: 70px; }
   const $$ = s => [...document.querySelectorAll(s)];
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const bewegungAus = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // Browser-Speicher nur für Bequemlichkeit (Darstellung, Versatz).
-  // Kann im privaten Fenster fehlen, daher immer abgesichert.
+  // Browser-Speicher nur für Bequemlichkeit; im privaten Fenster evtl. nicht da
   const speicher = {
     get(k) { try { return localStorage.getItem(k); } catch { return null; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch { /* egal */ } },
+    weg(k) { try { localStorage.removeItem(k); } catch { /* egal */ } },
   };
 
   const gespeicherterVersatz = parseFloat(speicher.get('adric.versatz'));
   const zustand = {
-    text: null,
-    dateiname: '',
+    text: null, dateiname: '', ki: null, online: null, termineOhneAnruf: [], korrekturen: null,
     versatz: Number.isFinite(gespeicherterVersatz) ? gespeicherterVersatz : STANDARD_STUNDENVERSATZ,
-    art: 'woche',          // woche | letzteWoche | 30tage | alles | eigen
-    von: null,
-    bis: null,
-    daten: null,           // Ergebnis von leseAnrufe
+    art: 'woche', von: null, bis: null, daten: null,
   };
 
   /* ---------- Formatierung ---------- */
@@ -857,21 +1143,24 @@ input[type="number"] { width: 70px; }
   const datumLang = iso => `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}`;
   const uhrzeit = d => `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
   const versatzText = v => (v >= 0 ? '+' : '−') + Math.abs(v) + ' h';
+  const tageZwischen = (a, b) => Math.round((isoZuDate(b) - isoZuDate(a)) / 864e5);
   function kalenderwoche(iso) {
     const d = isoZuDate(iso);
-    d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));       // Donnerstag derselben Woche
+    d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));
     const jan4 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
     return 1 + Math.round(((d - jan4) / 864e5 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
   }
   function zeitraumBeschriftung(von, bis) {
     if (!von && !bis) return 'Alle Daten';
     const v = von ? datumLang(von) : 'Anfang', b = bis ? datumLang(bis) : 'Ende';
-    const istWoche = von && bis && kalenderwoche(von) === kalenderwoche(bis) && tagPlus(von, 6) === bis;
+    const istWoche = von && bis && tagPlus(von, 6) === bis && isoZuDate(von).getUTCDay() === 1;
     return (istWoche ? `KW ${kalenderwoche(von)} · ` : '') + `${v} – ${b}`;
   }
+  const labelErgebnis = k => KI_ERGEBNISSE[k]?.label || KATEGORIEN[k] || k;
+  const gruppeErgebnis = k => KI_ERGEBNISSE[k]?.gruppe || k;
 
   /* ---------- Kleine Bausteine ---------- */
-  const STICHPROBE_TITEL = `Weniger als ${MINDEST_STICHPROBE} Anrufe – die Quote ist nicht belastbar`;
+  const STICHPROBE_TITEL = `Weniger als ${MINDEST_STICHPROBE} – die Quote ist nicht belastbar`;
   const kleinHinweis = n => `<span class="klein" title="${esc(STICHPROBE_TITEL)}">⚠ Stichprobe zu klein (${n})</span>`;
   const legende = () => `<div class="legende">
       <span><i class="farbe f-gespraech"></i>Gespräch</span>
@@ -888,7 +1177,6 @@ input[type="number"] { width: 70px; }
            (t.kleineStichprobe && t.anrufe ? `\n⚠ Stichprobe zu klein` : '');
   }
 
-  // Gestapelter Balken: Länge = Anrufe, Teile = Ergebnis
   function balken(t, max, klasse = 'balken') {
     if (!t.anrufe) return `<div class="${klasse}"></div>`;
     const teile = [['gespraech', t.gespraech], ['falsch', t.falsch], ['niemand', t.niemand]]
@@ -904,7 +1192,7 @@ input[type="number"] { width: 70px; }
     const max = Math.max(...eintraege.map(e => e.t.anrufe));
     const kopf = `<div class="reihe kopfzeile"><span class="l"></span><span class="b"></span>
       <span class="n">Anrufe</span><span class="t">Termine</span><span class="q">Quote</span><span class="w"></span></div>`;
-    const zeilen = eintraege.map(({ label, t }) => {
+    return `<div class="reihen">${kopf}${eintraege.map(({ label, t }) => {
       const unsicher = t.anrufe > 0 && t.kleineStichprobe;
       return `<div class="reihe${t.anrufe ? '' : ' leer'}" data-tip="${esc(label + '\n' + aufteilungText(t))}">
         <span class="l">${esc(label)}</span>
@@ -913,17 +1201,39 @@ input[type="number"] { width: 70px; }
         <span class="t num${t.termin ? ' hat' : ''}">${t.termin ? zahl(t.termin) : '–'}</span>
         <span class="q num${unsicher ? ' quote-unsicher' : ''}">${t.anrufe ? prozent(t.quote) : '–'}</span>
         <span class="w">${unsicher ? kleinHinweis(t.anrufe) : ''}</span></div>`;
-    }).join('');
-    return `<div class="reihen">${kopf}${zeilen}</div>`;
+    }).join('')}</div>`;
   }
 
-  /* ---------- Darstellung des Boards ---------- */
+  // Zahl beim Erscheinen hochzählen
+  function zaehleHoch(wurzel) {
+    for (const el of wurzel.querySelectorAll('[data-ziel]')) {
+      const ziel = Number(el.dataset.ziel);
+      if (bewegungAus || !ziel) { el.textContent = zahl(ziel); continue; }
+      const start = performance.now(), dauer = 900;
+      const schritt = jetzt => {
+        const t = Math.min(1, (jetzt - start) / dauer), e = 1 - Math.pow(1 - t, 3);
+        el.textContent = zahl(Math.round(ziel * e));
+        if (t < 1) requestAnimationFrame(schritt);
+      };
+      requestAnimationFrame(schritt);
+    }
+  }
+
+  function deltaHtml(jetzt, vorher, name) {
+    if (vorher == null) return '';
+    const d = jetzt - vorher;
+    const klasse = d > 0 ? 'hoch' : d < 0 ? 'runter' : 'gleich';
+    return `<span class="delta ${klasse}" title="Vergleich mit ${esc(name)}: ${vorher}">${d > 0 ? '▲' : d < 0 ? '▼' : '='} ${Math.abs(d)} ggü. ${esc(name)}</span>`;
+  }
+
+  /* ---------- Board zeichnen ---------- */
   function zeichne() {
     const d = zustand.daten;
-    $('#start').hidden = !!d;
+    $('#start').hidden = !!d || !$('#sperre').hidden;
     $('#steuerung').hidden = !d;
     $('#board').hidden = !d;
     $('#drucken').hidden = !d;
+    $('#sperren').hidden = !zustand.online;
     if (!d) return;
 
     $$('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.art === zustand.art)));
@@ -933,78 +1243,162 @@ input[type="number"] { width: 70px; }
     $('#versatz').value = zustand.versatz;
     $('#dateiname').textContent = zustand.dateiname;
 
-    const r = auswerten(d.anrufe, zustand.von, zustand.bis);
+    const r = auswerten(d.anrufe, zustand.von, zustand.bis, zustand.termineOhneAnruf);
     const g = r.gesamt;
+    const termineGesamt = g.termin + r.termineOhneAnruf.length;
+    letzteAuswertung = r;
     $('#zeitraumText').textContent = zeitraumBeschriftung(zustand.von, zustand.bis);
 
-    // Kennzahlenband
-    const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
-    $('#kpis').innerHTML = `
-      <div class="card kpi"><div class="titel">Anrufe</div><div class="wert">${zahl(g.anrufe)}</div>
-        <div class="zusatz">an ${zahl(r.telefontage)} Telefontag${r.telefontage === 1 ? '' : 'en'} · Ø ${proTag} pro Tag</div></div>
-      <div class="card kpi"><div class="titel">Gespräche</div><div class="wert">${zahl(g.gespraech)}</div>
-        <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">Quote ${prozent(g.quote)}</span>
-        ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}<span>Obergrenze</span></div></div>
-      <div class="card kpi termin"><div class="titel">Termine gebucht</div><div class="wert">${zahl(g.termin)}</div>
-        <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(g.terminQuote)} der Gespräche</span>
-        ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}</div></div>
-      <div class="card kpi"><div class="titel">Kontakte</div><div class="wert">${zahl(r.kontakte)}</div>
-        <div class="zusatz">verschiedene Personen</div></div>
-      <div class="card kpi"><div class="titel">Firmen</div><div class="wert">${zahl(r.firmen)}</div>
-        <div class="zusatz">verschiedene Unternehmen</div></div>`;
+    // Vorperiode gleicher Länge für die Pfeile
+    let v = null, vName = '';
+    if (zustand.von && zustand.bis) {
+      const laenge = tageZwischen(zustand.von, zustand.bis) + 1;
+      v = auswerten(d.anrufe, tagPlus(zustand.von, -laenge), tagPlus(zustand.von, -1), zustand.termineOhneAnruf);
+      vName = laenge === 7 ? 'Vorwoche' : 'Vorperiode';
+    }
 
-    // Ergebnis-Aufteilung
-    const anteil = n => g.anrufe ? prozent(n / g.anrufe) : '–';
-    $('#ergebnis').innerHTML = `
-      <h2>Ergebnis der Anrufe</h2>
-      ${legende()}
-      <div data-tip="${esc(aufteilungText(g))}">${balken(g, g.anrufe, 'balken-gross')}</div>
-      <div class="aufteilung">
-        <div><div class="titel"><i class="farbe f-gespraech"></i>Gespräch</div>
-          <span class="zahl">${zahl(g.gespraech)}</span> <span class="anteil">${anteil(g.gespraech)}</span>
-          <span class="termin-marke">davon ${zahl(g.termin)} mit Termin</span></div>
-        <div><div class="titel"><i class="farbe f-falsch"></i>Falscher Kontakt / abwesend</div>
-          <span class="zahl">${zahl(g.falsch)}</span> <span class="anteil">${anteil(g.falsch)}</span></div>
-        <div><div class="titel"><i class="farbe f-niemand"></i>Niemand erreicht</div>
-          <span class="zahl">${zahl(g.niemand)}</span> <span class="anteil">${anteil(g.niemand)}</span></div>
-      </div>
-      <p class="notiz-klein">„Gespräch“ ist eine Obergrenze: Gezählt wird jede Notiz, die keines der Stichwörter für
-        „niemand erreicht“ oder „falscher Kontakt“ enthält. Von Hand nachgezählt fällt der Wert niedriger aus.
-        „Termin gebucht“ wird über eigene Stichwörter erkannt, etwa „Termin vereinbart“ oder „call gebucht“.
-        Quoten aus weniger als ${MINDEST_STICHPROBE} Anrufen bzw. Gesprächen sind mit ⚠ markiert und nicht belastbar.</p>`;
+    // Hero
+    const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    $('#hero').innerHTML = `
+      <div class="card kpi gross auftritt" data-liste="termine" tabindex="0" role="button"><div class="titel">Termine gebucht</div>
+        <div class="wert" data-ziel="${termineGesamt}">0</div>
+        <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${zahl(g.termin)} aus Anrufen · ${prozent(g.terminQuote)} der Gespräche</span>
+          ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}
+          ${r.termineOhneAnruf.length ? `<span>+ ${zahl(r.termineOhneAnruf.length)} ohne Anruf</span>` : ''}
+          ${deltaHtml(termineGesamt, v ? v.gesamt.termin + v.termineOhneAnruf.length : null, vName)}</div></div>
+      <div class="card kpi auftritt" data-liste="anrufe" tabindex="0" role="button"><div class="titel">Anrufe</div><div class="wert" data-ziel="${g.anrufe}">0</div>
+        <div class="zusatz"><span>${zahl(r.telefontage)} Telefontag${r.telefontage === 1 ? '' : 'e'} · Ø ${proTag}</span>${deltaHtml(g.anrufe, v?.gesamt.anrufe, vName)}</div></div>
+      <div class="card kpi auftritt" data-liste="gespraeche" tabindex="0" role="button"><div class="titel">Gespräche</div><div class="wert" data-ziel="${g.gespraech}">0</div>
+        <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">Quote ${prozent(g.quote)}</span>
+          ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}${deltaHtml(g.gespraech, v?.gesamt.gespraech, vName)}</div></div>
+      <div class="card kpi auftritt" data-liste="kontakte" tabindex="0" role="button"><div class="titel">Kontakte</div><div class="wert" data-ziel="${r.kontakte}">0</div>
+        <div class="zusatz">verschiedene Personen</div></div>
+      <div class="card kpi auftritt" data-liste="firmen" tabindex="0" role="button"><div class="titel">Firmen</div><div class="wert" data-ziel="${r.firmen}">0</div>
+        <div class="zusatz">verschiedene Unternehmen</div></div>`;
+    zaehleHoch($('#hero'));
 
     // Leerer Zeitraum
     const leer = g.anrufe === 0;
     $('#auswertungen').hidden = leer;
-    $('#ergebnis').hidden = leer;
     $('#leer').hidden = !leer;
     if (leer) {
       $('#leer').innerHTML = d.anrufe.length
-        ? `Keine Anrufe in diesem Zeitraum. Die Datei enthält Anrufe vom ${datumLang(erster)} bis ${datumLang(letzter)}.<br><br>
+        ? `Keine Anrufe in diesem Zeitraum. Die Daten reichen vom ${datumLang(erster)} bis ${datumLang(letzter)}.<br><br>
            <button class="knopf" type="button" data-art="alles">Alles anzeigen</button>`
         : 'Die Datei enthält keine Anrufe mit Notiz.';
+      $('#fuss').textContent = '';
+      return;
     }
 
-    // Pro Tag
+    // Trichter
+    const erreicht = g.anrufe - g.niemand;
+    const mitKi = r.kiAnzahl > 0;
+    const interessiert = (r.interesse.hoch || 0) + (r.interesse.mittel || 0);
+    const stufen = [
+      ['Anrufe', g.anrufe, null, 'anrufe'],
+      ['Jemand erreicht', erreicht, g.anrufe, 'erreicht'],
+      ['Gespräch', g.gespraech, erreicht, 'gespraeche'],
+      ...(mitKi ? [['Interesse', interessiert, g.gespraech, 'interesse']] : []),
+      ['Termin', g.termin, mitKi ? interessiert : g.gespraech, 'termine'],
+    ];
+    $('#trichter').innerHTML = stufen.map(([label, n, basis, liste], i) => {
+      const quote = basis ? n / basis : null;
+      return `<div class="stufe" data-liste="${liste}" title="Liste anzeigen">
+        <span class="l">${esc(label)}</span>
+        <div class="spur"><div class="fuell" style="width:${g.anrufe ? Math.max(1.5, n / g.anrufe * 100) : 0}%; animation: wachsen .8s ${i * 0.08}s cubic-bezier(.2,.8,.2,1) both; transform-origin:left"></div></div>
+        <span class="n num">${zahl(n)}</span>
+        <span class="r">${i === 0 ? '100 %' : `${prozent(quote)} der Stufe davor`}${basis != null && basis < MINDEST_STICHPROBE && i ? ' ' + kleinHinweis(basis) : ''}</span>
+      </div>`;
+    }).join('') + (mitKi ? '' : '<p class="notiz-klein">„Interesse“ erscheint, sobald KI-Einordnungen vorliegen.</p>');
+
+    // Ergebnis-Verteilung (KI-Detail oder Regel-Gruppe)
+    const det = Object.entries(r.details).sort((a, b) => b[1] - a[1]);
+    const maxDet = det[0]?.[1] || 1;
+    $('#ergebnisZusatz').textContent = mitKi ? `${zahl(r.kiAnzahl)} von ${zahl(g.anrufe)} per KI eingeordnet` : 'nach Stichwortregeln';
+    $('#ergebnis').innerHTML = legende() + `<div data-tip="${esc(aufteilungText(g))}">${balken(g, g.anrufe, 'balken-gross')}</div>` +
+      det.map(([k, n]) => `<div class="vert" data-liste="detail:${esc(k)}" title="Liste anzeigen">
+        <span>${esc(labelErgebnis(k))}</span>
+        <div class="spur"><i class="f-${gruppeErgebnis(k)}" style="width:${(n / maxDet * 100).toFixed(1)}%"></i></div>
+        <span class="n num">${zahl(n)}</span><span class="p num">${prozent(n / g.anrufe)}</span></div>`).join('') +
+      `<p class="notiz-klein">${mitKi
+        ? `Eingeordnet per OpenAI. Bei einer Sicherheit unter ${Math.round(KI_MINDEST_SICHERHEIT * 100)} % gilt die Stichwortregel (${zahl(r.unsicher.length)} Fälle).`
+        : '„Gespräch“ ist hier eine Obergrenze: Gezählt wird jede Notiz ohne Stichwort für „niemand erreicht“ oder „falscher Kontakt“.'}</p>`;
+
+    // Heatmap Wochentag × Stunde
+    const tageMit = WOCHENTAGE.map((_, i) => i).filter(i => i < 5 || r.heat[i].some(t => t.anrufe));
+    const stunden = r.proStunde.filter(t => t.anrufe).map(t => t.stunde);
+    const ab = Math.min(...stunden), bis = Math.max(...stunden);
+    const spalten = Array.from({ length: bis - ab + 1 }, (_, i) => ab + i);
+    $('#heatZusatz').textContent = `Gesprächsquote nach Wochentag und Uhrzeit, deutsche Zeit (${versatzText(zustand.versatz)})`;
+    $('#heat').innerHTML = `<div class="heat-scroll"><div class="heat" style="grid-template-columns: 34px repeat(${spalten.length}, minmax(38px, 1fr))">
+      <span></span>${spalten.map(h => `<span class="kopf-h">${String(h).padStart(2, '0')}</span>`).join('')}
+      ${tageMit.map(i => `<span class="tag">${KURZTAG[i]}</span>` + spalten.map(h => {
+        const t = r.heat[i][h];
+        if (!t.anrufe) return '<div class="zelle leer"></div>';
+        const st = Math.round(12 + (t.quote || 0) * 88);
+        return `<div class="zelle${t.kleineStichprobe ? ' dünn' : ''}" style="--st:${st}%"
+          data-tip="${esc(`${WOCHENTAGE[i]} ${String(h).padStart(2, '0')}–${String(h + 1).padStart(2, '0')} Uhr\n` + aufteilungText(t))}">
+          <span class="q">${prozent(t.quote)}</span><span class="n">${t.anrufe} Anr.</span></div>`;
+      }).join('')).join('')}
+    </div></div>
+    <div class="heat-legende"><span>Gesprächsquote</span><span>0 %</span><span class="verlauf"></span><span>100 %</span>
+      <span class="muster"></span><span>schraffiert = weniger als ${MINDEST_STICHPROBE} Anrufe, Quote nicht belastbar</span></div>`;
+
+    // Termine
+    $('#termineZusatz').textContent = `${zahl(termineGesamt)} im Zeitraum` + (r.termineOhneAnruf.length ? `, davon ${zahl(r.termineOhneAnruf.length)} ohne Anruf` : '');
+    const karteOhneAnruf = t => `
+      <article class="termin">
+        <div class="wann">${tagKurz(t.datum)} · <span class="chip">ohne Anruf</span></div>
+        <div class="wer">${esc(t.name || '–')}</div>
+        <div class="firma">${esc(t.firma || '–')}</div>
+        ${t.notiz ? `<div class="notiz">${esc(t.notiz)}</div>` : ''}
+      </article>`;
+    $('#termine').innerHTML = termineGesamt ? `<div class="termine">${r.termineOhneAnruf.map(karteOhneAnruf).join('')}${r.termine.map(a => `
+      <article class="termin">
+        <div class="wann">${tagKurz(a.tag)} · ${uhrzeit(a.zeit)}</div>
+        <div class="wer">${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</div>
+        <div class="firma">${esc(a.firma || '–')}</div>
+        ${a.schritt ? `<div class="schritt"><span class="chip">→ ${esc(a.schritt)}</span></div>` : ''}
+        ${a.manuell ? '<div class="schritt"><span class="chip">von Hand bestätigt</span></div>' : ''}
+        <div class="notiz">${esc(a.notiz)}</div>
+      </article>`).join('')}</div>` : '<p class="notiz-klein">Keine gebuchten Termine im Zeitraum.</p>';
+
+    // Reihen
     $('#proTag').innerHTML = reihen(r.proTag.map(t => ({ label: tagKurz(t.tag), t })));
-
-    // Pro Wochentag: Montag bis Freitag immer, Wochenende nur mit Anrufen
-    $('#proWochentag').innerHTML = reihen(r.proWochentag
-      .filter((t, i) => i < 5 || t.anrufe > 0)
-      .map(t => ({ label: t.label, t })));
-
-    // Pro Stunde: von der ersten bis zur letzten Stunde mit Anrufen, Lücken sichtbar
-    const mitAnrufen = r.proStunde.filter(t => t.anrufe);
-    const ab = mitAnrufen[0]?.stunde ?? 0, bis = mitAnrufen[mitAnrufen.length - 1]?.stunde ?? -1;
+    $('#proWochentag').innerHTML = reihen(r.proWochentag.filter((t, i) => i < 5 || t.anrufe > 0).map(t => ({ label: t.label, t })));
     $('#proStunde').innerHTML = reihen(r.proStunde.slice(ab, bis + 1)
       .map(t => ({ label: `${String(t.stunde).padStart(2, '0')}–${String((t.stunde + 1) % 24).padStart(2, '0')} Uhr`, t })));
-    $('#stundeZusatz').textContent = `deutsche Zeit, Versatz ${versatzText(zustand.versatz)}`;
-
-    // Nummerntyp
+    $('#stundeZusatz').textContent = `Versatz ${versatzText(zustand.versatz)}`;
     $('#proNummer').innerHTML = reihen(r.proNummerTyp.filter(t => t.anrufe).map(t => ({ label: t.label, t })))
       + `<p class="notiz-klein">Mobil = deutsche Nummer mit 015, 016 oder 017. Festnetz = andere deutsche Nummer.</p>`;
 
-    // Top-Firmen (ohne Quote: bei einzelnen Firmen fast immer zu wenig Anrufe)
+    // KI und Regeln uneinig
+    $('#uneinigKarte').hidden = !mitKi;
+    if (mitKi) {
+      $('#uneinigKarte').innerHTML = `<details class="uneinig"${r.uneinig.length && r.uneinig.length <= 12 ? ' open' : ''}>
+        <summary><h2>KI und Stichwortregeln uneinig <span class="h2-zusatz">${zahl(r.uneinig.length)} Anrufe · zum Prüfen</span></h2><span class="pfeil">▾</span></summary>
+        ${r.uneinig.length ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Regel → KI</th><th>Notiz</th></tr></thead><tbody>
+        ${r.uneinig.map(a => `<tr>
+          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}</td>
+          <td>${esc(KATEGORIEN[a.regel.kategorie])}${a.regel.termin ? ' + Termin' : ''}<br><span class="pfeil">→</span> <strong>${esc(labelErgebnis(a.ki.ergebnis))}${a.ki.termin ? ' + Termin' : ''}</strong>
+            <div class="klein-text">Sicherheit ${prozent(a.ki.sicherheit)}${a.quelle === 'ki' ? '' : ' · zu unsicher, Regel zählt'}</div></td>
+          <td class="notiztext">${esc(a.notiz)}${a.ki.begruendung ? `<div class="klein-text">KI: ${esc(a.ki.begruendung)}</div>` : ''}</td></tr>`).join('')}
+        </tbody></table>` : '<p class="notiz-klein">Keine Abweichungen im Zeitraum.</p>'}</details>`;
+    }
+
+    // Gespräche
+    $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
+    $('#gespraeche').innerHTML = r.gespraeche.length ? `
+      <table class="tabelle gespraeche">
+        <thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Notiz</th></tr></thead>
+        <tbody>${r.gespraeche.map(a => `<tr>
+          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin gebucht</span>' : ''}</td>
+          <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div>
+            ${a.interesse && a.interesse !== 'unklar' ? `<span class="chip ${esc(a.interesse)}">${esc(KI_INTERESSE[a.interesse])}</span>` : ''}</td>
+          <td class="notiztext">${esc(a.notiz)}${a.schritt ? `<div class="klein-text">→ ${esc(a.schritt)}</div>` : ''}</td></tr>`).join('')}</tbody>
+      </table>` : '<p class="notiz-klein">Keine Gespräche im Zeitraum.</p>';
+
+    // Top-Firmen
     const top = r.topFirmen.slice(0, 10);
     const maxF = top[0]?.anrufe || 0;
     $('#firmen').innerHTML = top.length ? `
@@ -1017,30 +1411,84 @@ input[type="number"] { width: 70px; }
       ${r.topFirmen.length > 10 ? `<p class="notiz-klein">Die 10 meistangerufenen von ${zahl(r.topFirmen.length)} Firmen.</p>` : ''}`
       : '<p class="notiz-klein">Keine Firmennamen im Zeitraum.</p>';
 
-    // Gebuchte Termine und alle Gespräche
-    const tabelle = (liste, leerText) => liste.length ? `
-      <table class="tabelle gespraeche">
-        <thead><tr><th>Zeitpunkt</th><th>Name</th><th>Firma</th><th>Notiz</th></tr></thead>
-        <tbody>${liste.map(a => `<tr>
-          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin gebucht</span>' : ''}</td>
-          <td>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</td>
-          <td>${esc(a.firma || '–')}</td>
-          <td class="notiztext">${esc(a.notiz)}</td></tr>`).join('')}</tbody>
-      </table>` : `<p class="notiz-klein">${leerText}</p>`;
-    $('#termineZusatz').textContent = `${zahl(r.termine.length)} im Zeitraum`;
-    $('#termine').innerHTML = tabelle(r.termine, 'Keine gebuchten Termine im Zeitraum.');
-    $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
-    $('#gespraeche').innerHTML = tabelle(r.gespraeche, 'Keine Gespräche im Zeitraum.');
-
     // Datenbasis
     const s = d.stat;
-    const tz = { ';': 'Semikolon', ',': 'Komma', '\t': 'Tab' }[s.trennzeichen];
-    $('#fuss').textContent = `Datenbasis: ${zustand.dateiname} · ${zahl(s.datenzeilen)} Zeilen gelesen · ` +
-      `${zahl(s.keinAnruf)} ohne Notiz entfernt · ${zahl(s.dubletten)} Dubletten entfernt` +
-      (s.ohneDatum ? ` · ${zahl(s.ohneDatum)} ohne lesbares Datum entfernt` : '') +
-      ` · ${zahl(d.anrufe.length)} Anrufe insgesamt (${erster ? datumLang(erster) + ' – ' + datumLang(letzter) : '–'})` +
-      ` · Uhrzeiten mit Versatz ${versatzText(zustand.versatz)} · Trennzeichen ${tz}`;
+    $('#fuss').textContent = `Datenbasis: ${zustand.dateiname} · ${zahl(d.anrufe.length)} Anrufe (${datumLang(erster)} – ${datumLang(letzter)})` +
+      ` · ${zahl(s.dubletten)} Dubletten entfernt · Uhrzeiten mit Versatz ${versatzText(zustand.versatz)}` +
+      (zustand.online?.modell ? ` · KI: ${zustand.online.modell}` : '') + ` · Quoten aus weniger als ${MINDEST_STICHPROBE} Fällen sind mit ⚠ markiert.`;
   }
+
+  /* ---------- Detail-Listen hinter Kacheln, Trichter und Ergebnissen ---------- */
+  let letzteAuswertung = null;
+  const anrufZeile = a => `<tr>
+    <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin</span>' : ''}</td>
+    <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div></td>
+    <td><span class="farbe f-${a.kategorie}"></span> ${esc(labelErgebnis(a.detail || a.kategorie))}</td>
+    <td class="notiztext">${esc(a.notiz)}</td></tr>`;
+  const anrufTabelle = liste => liste.length
+    ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Ergebnis</th><th>Notiz</th></tr></thead>
+       <tbody>${liste.map(anrufZeile).join('')}</tbody></table>`
+    : '<p class="notiz-klein">Keine Einträge.</p>';
+
+  function oeffneListe(schluessel) {
+    const r = letzteAuswertung;
+    if (!r) return;
+    let titel, html;
+    if (schluessel === 'firmen') {
+      titel = `${zahl(r.topFirmen.length)} Firmen`;
+      html = `<table class="tabelle firmen"><thead><tr><th>Firma</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Termine</th><th class="num neben">Kontakte</th></tr></thead>
+        <tbody>${r.topFirmen.map(f => `<tr><td>${esc(f.name)}</td><td class="num">${zahl(f.anrufe)}</td><td class="num">${zahl(f.gespraech)}</td>
+        <td class="num">${f.termin ? zahl(f.termin) : '–'}</td><td class="num neben">${zahl(f.kontakte)}</td></tr>`).join('')}</tbody></table>`;
+    } else if (schluessel === 'kontakte') {
+      const map = new Map();
+      for (const a of r.anrufe) {
+        const name = `${a.vorname} ${a.nachname}`.trim();
+        const k = a.kontaktId || `${name.toLowerCase()}|${a.telefon}`;
+        if (!a.kontaktId && !name && !a.telefon) continue;
+        const e = map.get(k) || { name: name || '–', firma: a.firma, anrufe: 0, gespraech: 0, termin: 0, letzte: a };
+        e.anrufe++; if (a.kategorie === 'gespraech') e.gespraech++; if (a.termin) e.termin++;
+        if (a.zeit > e.letzte.zeit) e.letzte = a;
+        map.set(k, e);
+      }
+      const liste = [...map.values()].sort((x, y) => y.anrufe - x.anrufe || x.name.localeCompare(y.name, 'de'));
+      titel = `${zahl(liste.length)} Kontakte`;
+      html = `<table class="tabelle firmen"><thead><tr><th>Kontakt</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Termine</th><th class="neben">Zuletzt</th></tr></thead>
+        <tbody>${liste.map(e => `<tr><td><strong>${esc(e.name)}</strong><div class="klein-text">${esc(e.firma || '–')}</div></td>
+        <td class="num">${zahl(e.anrufe)}</td><td class="num">${zahl(e.gespraech)}</td><td class="num">${e.termin ? zahl(e.termin) : '–'}</td>
+        <td class="neben klein-text">${tagKurz(e.letzte.tag)} · ${esc(labelErgebnis(e.letzte.detail || e.letzte.kategorie))}</td></tr>`).join('')}</tbody></table>`;
+    } else {
+      const filter = {
+        anrufe: [`${zahl(r.anrufe.length)} Anrufe`, r.anrufe],
+        gespraeche: [`${zahl(r.gespraeche.length)} Gespräche`, r.gespraeche],
+        erreicht: ['Jemand erreicht', r.anrufe.filter(a => a.kategorie !== 'niemand')],
+        interesse: ['Gespräche mit Interesse', r.gespraeche.filter(a => a.interesse === 'hoch' || a.interesse === 'mittel')],
+        termine: [`Termine aus Anrufen`, r.termine],
+      }[schluessel];
+      if (filter) [titel, html] = [filter[0], anrufTabelle(filter[1])];
+      else if (schluessel.startsWith('detail:')) {
+        const k = schluessel.slice(7);
+        const liste = r.anrufe.filter(a => (a.detail || a.kategorie) === k);
+        [titel, html] = [`${labelErgebnis(k)} · ${zahl(liste.length)}`, anrufTabelle(liste)];
+      } else return;
+      if (schluessel === 'termine' && r.termineOhneAnruf.length) {
+        html += `<p class="notiz-klein">Dazu ${zahl(r.termineOhneAnruf.length)} Termin(e) ohne Anruf: ${r.termineOhneAnruf.map(t => esc(`${t.name} (${t.firma})`)).join(', ')}.</p>`;
+      }
+    }
+    $('#listeTitel').textContent = `${titel} · ${$('#zeitraumText').textContent}`;
+    $('#listeInhalt').innerHTML = html;
+    $('#liste').showModal();
+    $('#listeInhalt').scrollTop = 0;
+  }
+  $('#listeZu').addEventListener('click', () => $('#liste').close());
+  $('#liste').addEventListener('click', e => { if (e.target === $('#liste')) $('#liste').close(); });
+  document.addEventListener('click', e => {
+    const z = e.target.closest('[data-liste]');
+    if (z && !e.target.closest('dialog')) oeffneListe(z.dataset.liste);
+  });
+  document.addEventListener('keydown', e => {
+    const z = e.target.closest && e.target.closest('[data-liste]');
+    if (z && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); oeffneListe(z.dataset.liste); }
+  });
 
   /* ---------- Daten laden und rechnen ---------- */
   function zeigeFehler(text) {
@@ -1051,11 +1499,14 @@ input[type="number"] { width: 70px; }
   function rechne() {
     if (zustand.text == null) return;
     try {
-      zustand.daten = leseAnrufe(zustand.text, zustand.versatz);
+      const daten = leseAnrufe(zustand.text, zustand.versatz);
+      wendeKiAn(daten.anrufe, zustand.ki);
+      wendeKorrekturenAn(daten.anrufe, zustand.korrekturen);
+      zustand.daten = daten;
       zeigeFehler('');
     } catch (e) {
       zustand.daten = null;
-      zeigeFehler('Die Datei konnte nicht ausgewertet werden.\n' + e.message);
+      zeigeFehler('Die Daten konnten nicht ausgewertet werden.\n' + e.message);
     }
     zeichne();
   }
@@ -1068,15 +1519,72 @@ input[type="number"] { width: 70px; }
 
   async function ladeDatei(datei) {
     if (!datei) return;
-    const puffer = await datei.arrayBuffer();
-    let text;
-    try { text = new TextDecoder('utf-8', { fatal: true }).decode(puffer); }
-    catch { text = new TextDecoder('windows-1252').decode(puffer); }   // falls in Excel neu gespeichert
-    zustand.text = text;
-    zustand.dateiname = datei.name;
-    rechne();
-    if (zustand.daten && zustand.art !== 'eigen') waehleZeitraum(zustand.art);
+    try {
+      const { text, quelle } = await anrufCsvAus(await datei.arrayBuffer(), datei.name);
+      zustand.text = text;
+      zustand.dateiname = `Lokale Datei: ${quelle}`;
+      $('#sperre').hidden = true;
+      rechne();
+      if (zustand.daten && zustand.art !== 'eigen') waehleZeitraum(zustand.art);
+    } catch (e) {
+      zeigeFehler('Die Datei konnte nicht gelesen werden.\n' + e.message);
+    }
   }
+
+  /* ---------- Online-Daten: verschlüsselt, Passwort nötig ---------- */
+  let paket = null;
+  const MERK_SCHLUESSEL = 'adric.zugang';
+
+  async function oeffne(passwortOderSchluessel, merken) {
+    const { inhalt, schluessel } = await entschluessle(paket, passwortOderSchluessel);
+    if (merken) speicher.set(MERK_SCHLUESSEL, JSON.stringify({ salt: paket.salt, schluessel: b64(schluessel) }));
+    zustand.online = inhalt;
+    zustand.text = inhalt.csv;
+    zustand.ki = inhalt.ki || null;
+    zustand.termineOhneAnruf = Array.isArray(inhalt.termineOhneAnruf) ? inhalt.termineOhneAnruf : [];
+    zustand.korrekturen = inhalt.korrekturen || null;
+    const stand = new Date(inhalt.erstellt).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' });
+    zustand.dateiname = `Online-Daten · Stand ${stand}`;
+    $('#sperre').hidden = true;
+    rechne();
+    if (zustand.daten) waehleZeitraum(zustand.art === 'eigen' ? 'woche' : zustand.art);
+  }
+
+  async function starte() {
+    try {
+      const antwort = await fetch('data/anrufe.enc.json', { cache: 'no-store' });
+      if (antwort.ok) paket = await antwort.json();
+    } catch { /* offline oder als Datei geöffnet: dann nur Drag-and-drop */ }
+    if (!paket) { zeichne(); return; }
+
+    const gemerkt = (() => { try { return JSON.parse(speicher.get(MERK_SCHLUESSEL)); } catch { return null; } })();
+    if (gemerkt && gemerkt.salt === paket.salt) {
+      try { await oeffne(unb64(gemerkt.schluessel), false); return; }
+      catch { speicher.weg(MERK_SCHLUESSEL); }
+    }
+    zustand.online = null;
+    $('#sperre').hidden = false;
+    zeichne();
+    $('#passwort').focus();
+  }
+
+  $('#sperrForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const knopf = $('#entsperren');
+    knopf.disabled = true; knopf.textContent = 'Entschlüssele …';
+    $('#sperrMeldung').textContent = '';
+    try { await oeffne($('#passwort').value, $('#merken').checked); $('#passwort').value = ''; }
+    catch (err) { $('#sperrMeldung').textContent = err.message; $('#passwort').select(); }
+    finally { knopf.disabled = false; knopf.textContent = 'Entsperren'; }
+  });
+
+  $('#sperren').addEventListener('click', () => {
+    speicher.weg(MERK_SCHLUESSEL);
+    Object.assign(zustand, { text: null, ki: null, online: null, daten: null, dateiname: '', termineOhneAnruf: [], korrekturen: null });
+    $('#sperre').hidden = false;
+    zeichne();
+    $('#passwort').focus();
+  });
 
   /* ---------- Bedienung ---------- */
   $$('[data-datei]').forEach(inp => inp.addEventListener('change', () => { ladeDatei(inp.files[0]); inp.value = ''; }));
@@ -1114,21 +1622,19 @@ input[type="number"] { width: 70px; }
     rechne();
   });
 
-  // Darstellung: Auto (folgt dem System) → Hell → Dunkel
-  const THEMEN = ['auto', 'light', 'dark'];
-  const THEMA_TEXT = { auto: 'Auto', light: 'Hell', dark: 'Dunkel' };
+  // Darstellung: Dunkel (Standard) ↔ Hell
   function setzeThema(t) {
-    if (t === 'auto') document.documentElement.removeAttribute('data-theme');
-    else document.documentElement.setAttribute('data-theme', t);
-    $('#thema').textContent = 'Darstellung: ' + THEMA_TEXT[t];
+    if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    else document.documentElement.removeAttribute('data-theme');
+    $('#thema').textContent = t === 'light' ? 'Dunkel' : 'Hell';
     speicher.set('adric.thema', t);
   }
-  let thema = THEMEN.includes(speicher.get('adric.thema')) ? speicher.get('adric.thema') : 'auto';
+  let thema = speicher.get('adric.thema') === 'light' ? 'light' : 'dark';
   setzeThema(thema);
-  $('#thema').addEventListener('click', () => { thema = THEMEN[(THEMEN.indexOf(thema) + 1) % 3]; setzeThema(thema); });
+  $('#thema').addEventListener('click', () => { thema = thema === 'light' ? 'dark' : 'light'; setzeThema(thema); });
   $('#drucken').addEventListener('click', () => window.print());
 
-  // Tooltip für Balken und Tabellenzeilen
+  // Tooltip
   const tip = $('#tip');
   document.addEventListener('mousemove', e => {
     const ziel = e.target.closest('[data-tip]');
@@ -1145,13 +1651,13 @@ input[type="number"] { width: 70px; }
   document.addEventListener('mouseleave', () => { tip.hidden = true; });
 
   // Für die Fehlersuche in der Browser-Konsole: adricLadeText(text, 'name.csv')
-  window.adricLadeText = (text, name = 'eingefügt.csv') => {
-    zustand.text = text; zustand.dateiname = name; rechne();
+  window.adricLadeText = (text, name = 'eingefügt.csv', ki = null) => {
+    zustand.text = text; zustand.dateiname = name; zustand.ki = ki; $('#sperre').hidden = true; rechne();
     if (zustand.daten) waehleZeitraum(zustand.art === 'eigen' ? 'woche' : zustand.art);
   };
 
   $('#versatz').value = zustand.versatz;
-  zeichne();
+  starte();
 })();
 </script>
 </body>

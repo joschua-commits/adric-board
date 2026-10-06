@@ -4,3 +4,6 @@
 *.xlsx
 !test/testdaten.csv
 .DS_Store
+
+# Lokaler KI-Cache (enthält Einordnungen zu echten Notizen)
+.lokal/

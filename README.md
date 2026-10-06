@@ -4,6 +4,23 @@ Wertet den HubSpot-Export „Anrufsnotizen“ aus und zeigt ein Wochenboard: Anr
 
 Alles steckt in **einer Datei: `index.html`**. Es gibt kein Backend und keinen Build-Schritt. Die CSV wird nur im Browser gelesen und nirgendwohin hochgeladen. Ohne Internet funktioniert alles; es fehlt dann nur die Schrift IBM Plex Mono, und die Systemschrift springt ein (die Ziffern bleiben gleich breit).
 
+## Online-Daten aktualisieren (v2)
+
+Die Website lädt beim Öffnen `data/anrufe.enc.json` und fragt nach dem Passwort. Die Daten sind mit AES-256-GCM verschlüsselt, der Schlüssel wird per PBKDF2 mit 600.000 Runden aus dem Passwort abgeleitet. Entschlüsselt wird nur im Browser.
+
+Neuer HubSpot-Export (ZIP oder CSV):
+
+```bash
+cd ~/Documents/adric-board
+node tools/update.mjs ~/Downloads/hubspot-custom-report-anrufsnotizen-JJJJ-MM-TT.zip
+git add data && git commit -m "Daten aktualisiert" && git push
+```
+
+- **KI:** Nur neue oder geänderte Notizen gehen an OpenAI (`gpt-5-mini`, einstellbar über `OPENAI_MODEL`). Bekannte Notizen kommen aus `.lokal/ki-cache.json`. Der Key wird aus `~/adric job scraping/.env` gelesen und landet nie im Repo oder auf der Website.
+- **Passwort:** wird beim ersten Lauf gesetzt (mindestens 12 Zeichen) und liegt im macOS-Schlüsselbund. Neues Passwort setzen: `--neues-passwort`.
+- **Korrekturen von Hand:** in `.lokal/korrekturen.json`. Dort lassen sich Anrufe als Termin markieren, wenn der Termin erst danach per E-Mail zustande kam, und fehlende Firmennamen nachtragen. Termine ganz ohne Anruf gehören in `.lokal/termine-ohne-anruf.json` (`[{ "datum": "JJJJ-MM-TT", "firma": "…", "name": "…" }]`).
+- `.lokal/` steht in `.gitignore` und wird nie hochgeladen.
+
 ## Benutzen
 
 1. `index.html` im Browser öffnen (Doppelklick genügt).

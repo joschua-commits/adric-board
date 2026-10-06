@@ -193,6 +193,77 @@ test('liefert identische Kennzahlen', () => {
   assert.deepEqual(r.anrufe.map(a => a.notiz), anrufe.map(a => a.notiz));
 });
 
+console.log('\nKI-Übernahme, ZIP, Verschlüsselung');
+const atest = [];
+async function testA(name, fn) { atest.push([name, fn]); }
+testA('KI-Ergebnis übernimmt Kategorie, Detail und Termin', async () => {
+  const { anrufe: liste } = A.leseAnrufe(csv, 5);
+  const a = liste.find(x => x.engagementId === '1007');           // Regel: Gespräch
+  const b = liste.find(x => x.engagementId === '1001');           // Regel: Mailbox
+  const ki = {
+    '1007': { h: A.notizHash(a.notiz), ergebnis: 'gespraech', termin: true, interesse: 'hoch', schritt: 'Demo', sicherheit: 0.9 },
+    '1001': { h: A.notizHash(b.notiz), ergebnis: 'gespraech', termin: false, interesse: 'keins', sicherheit: 0.4 },   // unsicher
+  };
+  A.wendeKiAn(liste, ki);
+  assert.deepEqual([a.quelle, a.kategorie, a.detail, a.termin, a.interesse, a.uneinig], ['ki', 'gespraech', 'gespraech', true, 'hoch', true]);
+  assert.deepEqual([b.quelle, b.kategorie, b.uneinig], ['regel', 'niemand', true]);
+  const r = A.auswerten(liste, null, null);
+  assert.deepEqual([r.kiAnzahl, r.unsicher.length, r.uneinig.length, r.gesamt.termin], [1, 1, 2, 2]);
+});
+testA('Termine ohne Anruf zählen nur im Zeitraum und nicht in Gesprächsquoten', async () => {
+  const { anrufe: liste } = A.leseAnrufe(csv, 5);
+  const extra = [{ datum: '2026-09-30', firma: 'X', name: 'Y' }, { datum: '2026-08-01', firma: 'Z' }, { datum: 'kaputt' }];
+  const r = A.auswerten(liste, '2026-09-28', '2026-10-04', extra);
+  assert.deepEqual([r.termineOhneAnruf.length, r.gesamt.termin, r.gesamt.gespraech], [1, 1, 4]);
+});
+testA('Korrektur von Hand markiert einen Anruf als Termin', async () => {
+  const { anrufe: liste } = A.leseAnrufe(csv, 5);
+  A.wendeKorrekturenAn(liste, { termin: { '1007': true, '1010': false } });
+  const a = liste.find(x => x.engagementId === '1007'), b = liste.find(x => x.engagementId === '1010');
+  assert.deepEqual([a.termin, a.manuell, b.termin], [true, true, false]);
+});
+testA('KI-Eintrag mit veraltetem Notiz-Hash wird ignoriert', async () => {
+  const { anrufe: liste } = A.leseAnrufe(csv, 5);
+  A.wendeKiAn(liste, { '1001': { h: '00000000', ergebnis: 'gespraech', sicherheit: 1 } });
+  assert.equal(liste.find(x => x.engagementId === '1001').kategorie, 'niemand');
+});
+testA('ZIP: richtige CSV wird gefunden', async () => {
+  const { mkdtempSync, writeFileSync, readFileSync: rf } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const { tmpdir } = await import('node:os');
+  const d = mkdtempSync(join(tmpdir(), 'adric-'));
+  writeFileSync(join(d, 'hubspot-export-summary.csv'), '"Anrufnotizen"\n"x"\n');
+  writeFileSync(join(d, 'anrufsnotizen.csv'), csv);
+  execFileSync('zip', ['-q', '-j', join(d, 'e.zip'), join(d, 'hubspot-export-summary.csv'), join(d, 'anrufsnotizen.csv')]);
+  const z = rf(join(d, 'e.zip'));
+  const r = await A.anrufCsvAus(z.buffer.slice(z.byteOffset, z.byteOffset + z.byteLength), 'e.zip');
+  assert.equal(r.quelle, 'e.zip › anrufsnotizen.csv');
+  assert.equal(A.leseAnrufe(r.text, 5).anrufe.length, 19);
+});
+testA('ZIP: Pfade im Dateinamen werden abgelehnt', async () => {
+  const { mkdtempSync, writeFileSync, mkdirSync, readFileSync: rf } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const { tmpdir } = await import('node:os');
+  const d = mkdtempSync(join(tmpdir(), 'adric-'));
+  mkdirSync(join(d, 'sub')); writeFileSync(join(d, 'sub', 'a.csv'), 'x');
+  execFileSync('zip', ['-q', '-r', 'e.zip', 'sub'], { cwd: d });
+  const z = rf(join(d, 'e.zip'));
+  await assert.rejects(A.anrufCsvAus(z.buffer.slice(z.byteOffset, z.byteOffset + z.byteLength)), /Unerlaubter Dateiname/);
+});
+testA('Verschlüsselung: Hin und zurück, falsches Passwort scheitert', async () => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const paket = await A.verschluessle(JSON.stringify({ hallo: 'Welt ä' }), 'richtig-langes-passwort', salt);
+  assert.equal(paket.runden, 600000);
+  const { inhalt, schluessel } = await A.entschluessle(paket, 'richtig-langes-passwort');
+  assert.deepEqual(inhalt, { hallo: 'Welt ä' });
+  assert.deepEqual((await A.entschluessle(paket, schluessel)).inhalt, { hallo: 'Welt ä' });   // gemerkter Schlüssel
+  await assert.rejects(A.entschluessle(paket, 'falsch-falsch-falsch'), /Falsches Passwort/);
+});
+for (const [name, fn] of atest) {
+  try { await fn(); ok++; console.log('  ok   ' + name); }
+  catch (e) { fehler++; console.log('  FEHLER ' + name + '\n       ' + e.message.split('\n').join('\n       ')); }
+}
+
 console.log(`\n${ok} bestanden, ${fehler} fehlgeschlagen`);
 
 if (process.argv.includes('--zahlen')) {
