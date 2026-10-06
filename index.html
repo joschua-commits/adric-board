@@ -1594,7 +1594,17 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       },
     });
     if (antwort.status === 401) throw new Error('GitHub-Token ungültig oder abgelaufen. Bitte unter „Upload: aktiv“ neu eintragen.');
-    if (antwort.status === 403 || antwort.status === 404) throw new Error(`GitHub verweigert den Zugriff (${antwort.status}). Hat der Token Schreibrecht für ${REPO}?`);
+    if (antwort.status === 403 || antwort.status === 404) {
+      // GitHub nennt bei fein eingestellten Tokens die benötigte Berechtigung, z. B. "actions=read"
+      const noetig = antwort.headers.get('x-accepted-github-permissions') || '';
+      const namen = { actions: 'Actions', contents: 'Contents', metadata: 'Metadata' };
+      const stufe = { read: 'Read-only', write: 'Read and write' };
+      const fehlt = noetig.split(/[;,]/).map(t => t.trim().split('=')).filter(([k]) => namen[k])
+        .map(([k, v]) => `${namen[k]}: ${stufe[v] || v}`);
+      throw new Error(fehlt.length
+        ? `GitHub verweigert den Zugriff (${antwort.status}). Dem Token fehlt die Berechtigung „${fehlt.join(', ')}“ für ${REPO}.`
+        : `GitHub verweigert den Zugriff (${antwort.status}). Ist beim Token das Repo ${REPO} ausgewählt, mit „Contents: Read and write“ und „Actions: Read-only“?`);
+    }
     if (!antwort.ok) throw new Error(`GitHub-Fehler ${antwort.status}`);
     return antwort.json();
   }
