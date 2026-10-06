@@ -4,6 +4,19 @@ Wertet den HubSpot-Export „Anrufsnotizen“ aus und zeigt ein Wochenboard: Anr
 
 Alles steckt in **einer Datei: `index.html`**. Es gibt kein Backend und keinen Build-Schritt. Die CSV wird nur im Browser gelesen und nirgendwohin hochgeladen. Ohne Internet funktioniert alles; es fehlt dann nur die Schrift IBM Plex Mono, und die Systemschrift springt ein (die Ziffern bleiben gleich breit).
 
+## Neuen Export direkt im Board hochladen
+
+Board entsperren, ZIP oder CSV hineinziehen (oder „Neuen Export hochladen“). Das Board zeigt die Daten sofort an, verschlüsselt sie mit dem Passwort und legt sie unter `uploads/` ins Repo. Die GitHub Action `.github/workflows/upload.yml` ordnet dann neue Notizen per OpenAI ein, übernimmt bisherige Einordnungen und Korrekturen und speichert den neuen Stand. Nach 1–5 Minuten lädt das Board ihn automatisch nach.
+
+Einmalig nötig:
+- **Repo-Secrets** `OPENAI_API_KEY` und `BOARD_PASSWORT` (Befehle siehe unten, die Werte werden direkt aus `.env` und Schlüsselbund übergeben).
+- **Pro Browser ein GitHub-Token** („Upload einrichten“ im Board): Fine-grained, nur dieses Repo, Contents Read and write, Actions Read-only.
+
+```bash
+security find-generic-password -s adric-board-daten -a online -w | tr -d '\n' | gh secret set BOARD_PASSWORT
+grep -E '^OPENAI_API_KEY=' ~/"adric job scraping/.env" | cut -d= -f2- | tr -d " \"'\r\n" | gh secret set OPENAI_API_KEY
+```
+
 ## Online-Daten aktualisieren (v2)
 
 Die Website lädt beim Öffnen `data/anrufe.enc.json` und fragt nach dem Passwort. Die Daten sind mit AES-256-GCM verschlüsselt, der Schlüssel wird per PBKDF2 mit 600.000 Runden aus dem Passwort abgeleitet. Entschlüsselt wird nur im Browser.

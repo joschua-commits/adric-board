@@ -1,0 +1,52 @@
+# Verarbeitet einen im Board hochgeladenen Export:
+# entschlüsseln → neue Notizen per OpenAI einordnen → neu verschlüsseln → speichern.
+# Läuft nur bei Pushes auf main (also nur mit Schreibrecht), nie für Pull Requests aus Forks.
+name: Upload verarbeiten
+
+on:
+  push:
+    branches: [main]
+    paths: ['uploads/**']
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: upload
+  cancel-in-progress: false
+
+jobs:
+  verarbeiten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Einordnen und verschlüsseln
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BOARD_PASSWORT: ${{ secrets.BOARD_PASSWORT }}
+        run: |
+          datei=$(ls uploads/*.enc.json 2>/dev/null | sort | tail -1)
+          if [ -z "$datei" ]; then echo "Kein Upload gefunden."; exit 0; fi
+          node tools/update.mjs --upload "$datei"
+
+      - name: Neuen Stand speichern
+        run: |
+          git config user.name "adric-board-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -q --ignore-unmatch uploads/*.enc.json
+          git add data/anrufe.enc.json
+          git diff --cached --quiet && { echo "Keine Änderung."; exit 0; }
+          git commit -q -m "Neuer Stand aus Upload im Board"
+          git push
+
+      - name: GitHub Pages neu bauen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" --silent || true

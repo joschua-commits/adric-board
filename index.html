@@ -697,6 +697,23 @@ async function verschluessle(klartext, passwort, salt) {
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(klartext)));
   return { v: 1, kdf: 'PBKDF2-SHA256', runden: PBKDF2_RUNDEN, salt: b64(salt), iv: b64(iv), daten: b64Gross(ct) };
 }
+// Verschlüsselt mit einem schon abgeleiteten Schlüssel (Browser nach dem Entsperren).
+// Salt und Runden werden mitgegeben, damit das Gegenstück wieder per Passwort entschlüsseln kann.
+async function verschluessleMitSchluessel(klartext, roh, saltB64, runden = PBKDF2_RUNDEN) {
+  const key = await crypto.subtle.importKey('raw', roh, 'AES-GCM', false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(klartext)));
+  return { v: 1, kdf: 'PBKDF2-SHA256', runden, salt: saltB64, iv: b64(iv), daten: b64Gross(ct) };
+}
+
+// Nur die Anrufzeilen im Original-Spaltenformat – so klein wie möglich für Upload und Online-Daten
+function alsAnrufCsv(anrufe) {
+  const kopf = ['Anrufnotizen', 'Telefonnummer', 'Aktivitätsdatum', 'Unternehmensname', 'Nachname', 'Vorname', 'Engagement ID', 'Kontakt ID'];
+  const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  return [kopf, ...anrufe.map(a => [a.notiz, a.telefon, a.datumRoh, a.firma, a.nachname, a.vorname, a.engagementId, a.kontaktId])]
+    .map(z => z.map(q).join(',')).join('\n') + '\n';
+}
+
 // passwortOderSchluessel: Passwort (String) oder bereits abgeleiteter Schlüssel (Uint8Array)
 async function entschluessle(paket, passwortOderSchluessel) {
   const roh = typeof passwortOderSchluessel === 'string'
@@ -717,7 +734,7 @@ const ADRIC = {
   parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
   leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
   KI_ERGEBNISSE, KI_INTERESSE, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
-  entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, entschluessle, b64, unb64,
+  entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, verschluessleMitSchluessel, entschluessle, b64, unb64, alsAnrufCsv,
 };
 </script>
 
@@ -970,6 +987,21 @@ dialog.liste .kopfzeile { position: sticky; top: 0; z-index: 1; display: flex; j
 dialog.liste .kopfzeile h3 { margin: 0; font-size: 18px; }
 dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(86vh - 70px); }
 
+/* Upload-Status */
+.upload-status { display: flex; gap: 12px; align-items: center; padding: 12px 16px; margin-bottom: 14px; border-radius: 14px;
+  border: 1px solid var(--line-2); background: var(--card); font-size: 14px; }
+.upload-status.laeuft { border-color: color-mix(in oklab, var(--accent) 60%, transparent); }
+.upload-status.ok { border-color: color-mix(in oklab, var(--good) 60%, transparent); }
+.upload-status.fehler { border-color: var(--bad); color: var(--bad-ink); }
+.upload-status a { color: inherit; }
+.kreisel { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: dreh 0.9s linear infinite; flex: none; }
+@keyframes dreh { to { transform: rotate(360deg); } }
+.token-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.token-form input { flex: 1 1 260px; font: inherit; font-family: var(--mono); font-size: 13px; padding: 9px 12px; border-radius: 10px;
+  border: 1px solid var(--line-2); background: var(--card); color: var(--ink); }
+.anleitung { color: var(--ink-2); font-size: 14px; line-height: 1.6; }
+.anleitung a { color: var(--accent); }
+
 /* Tooltip */
 .tip { position: fixed; z-index: 20; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font-size: 12.5px;
   line-height: 1.45; padding: 7px 10px; border-radius: 9px; white-space: pre; font-family: var(--mono); font-variant-numeric: tabular-nums;
@@ -1074,10 +1106,12 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     </label>
     <div class="datei">
       <span class="quelle-punkt" aria-hidden="true"></span><span id="dateiname"></span>
-      <label class="knopf leise">Andere Datei<input type="file" accept=".csv,.zip,text/csv,application/zip" hidden data-datei></label>
+      <button class="knopf leise" type="button" id="uploadEinrichten" hidden>Upload einrichten</button>
+      <label class="knopf leise">Neuen Export hochladen<input type="file" accept=".csv,.zip,text/csv,application/zip" hidden data-datei></label>
     </div>
   </section>
 
+  <div id="uploadStatus" class="upload-status no-print" role="status" hidden></div>
   <div id="fehler" class="fehler" role="alert" hidden></div>
 
   <main id="board" hidden>
@@ -1234,6 +1268,8 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     $('#board').hidden = !d;
     $('#drucken').hidden = !d;
     $('#sperren').hidden = !zustand.online;
+    $('#uploadEinrichten').hidden = !zustand.online;
+    $('#uploadEinrichten').textContent = speicher.get(TOKEN_SCHLUESSEL) ? 'Upload: aktiv' : 'Upload einrichten';
     if (!d) return;
 
     $$('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.art === zustand.art)));
@@ -1526,10 +1562,118 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       $('#sperre').hidden = true;
       rechne();
       if (zustand.daten && zustand.art !== 'eigen') waehleZeitraum(zustand.art);
+      if (!zustand.daten) return;
+      if (zustand.online && zustand.schluessel && speicher.get(TOKEN_SCHLUESSEL)) speichereUpload(text, quelle);
+      else if (zustand.online) zeigeStatus('info', 'Nur in diesem Browser angezeigt (Stichwortregeln). Damit Uploads gespeichert und per KI eingeordnet werden: <button class="knopf leise" type="button" data-upload-einrichten>Upload einrichten</button>');
     } catch (e) {
       zeigeFehler('Die Datei konnte nicht gelesen werden.\n' + e.message);
     }
   }
+
+  /* ---------- Upload: verschlüsselt ins Repo, GitHub Action ordnet per KI ein ---------- */
+  const REPO = 'joschua-commits/adric-board';
+  const WORKFLOW = 'upload.yml';
+  const TOKEN_SCHLUESSEL = 'adric.ghtoken';
+  let uploadLaeuft = false;
+  const pause = ms => new Promise(r => setTimeout(r, ms));
+
+  function zeigeStatus(art, html) {
+    const el = $('#uploadStatus');
+    el.className = `upload-status no-print ${art}`;
+    el.innerHTML = (art === 'laeuft' ? '<span class="kreisel" aria-hidden="true"></span>' : '') + `<span>${html}</span>`;
+    el.hidden = false;
+  }
+
+  async function github(pfad, { method = 'GET', body, roh = false } = {}) {
+    const antwort = await fetch(`https://api.github.com/repos/${REPO}${pfad}`, {
+      method, body,
+      headers: {
+        Authorization: `Bearer ${speicher.get(TOKEN_SCHLUESSEL)}`,
+        Accept: roh ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    });
+    if (antwort.status === 401) throw new Error('GitHub-Token ungültig oder abgelaufen. Bitte unter „Upload: aktiv“ neu eintragen.');
+    if (antwort.status === 403 || antwort.status === 404) throw new Error(`GitHub verweigert den Zugriff (${antwort.status}). Hat der Token Schreibrecht für ${REPO}?`);
+    if (!antwort.ok) throw new Error(`GitHub-Fehler ${antwort.status}`);
+    return antwort.json();
+  }
+
+  async function speichereUpload(text, quelle) {
+    if (uploadLaeuft) { zeigeStatus('fehler', 'Es läuft schon ein Upload. Bitte warten.'); return; }
+    uploadLaeuft = true;
+    try {
+      const { anrufe } = leseAnrufe(text, 0);
+      zeigeStatus('laeuft', `Verschlüssele und lade ${zahl(anrufe.length)} Anrufe hoch …`);
+      const klar = JSON.stringify({ csv: alsAnrufCsv(anrufe), quelle, hochgeladen: new Date().toISOString() });
+      const up = await verschluessleMitSchluessel(klar, zustand.schluessel, paket.salt, paket.runden);
+      const res = await github(`/contents/uploads/upload-${Date.now()}.enc.json`, {
+        method: 'PUT', body: JSON.stringify({ message: 'Upload aus dem Board', content: btoa(JSON.stringify(up)) }),
+      });
+      const sha = res.commit.sha, start = Date.now();
+      zeigeStatus('laeuft', 'Hochgeladen ✓ · Die KI ordnet neue Notizen ein. Das dauert meist 1–5 Minuten, du kannst weiterarbeiten.');
+      for (;;) {
+        await pause(10000);
+        const { workflow_runs: laeufe } = await github(`/actions/workflows/${WORKFLOW}/runs?per_page=10`);
+        const lauf = laeufe.find(l => l.head_sha === sha);
+        if (lauf?.status === 'completed') {
+          if (lauf.conclusion !== 'success') throw new Error(`Die Verarbeitung ist fehlgeschlagen. <a href="${esc(lauf.html_url)}" target="_blank" rel="noopener">Details bei GitHub</a>`);
+          break;
+        }
+        if (Date.now() - start > 25 * 60e3) throw new Error('Die Verarbeitung dauert ungewöhnlich lange. Bitte später neu laden.');
+      }
+      // Neuen Stand direkt über die API holen, ohne auf GitHub Pages zu warten
+      paket = await github('/contents/data/anrufe.enc.json', { roh: true });
+      await oeffne(zustand.schluessel, false);
+      zeigeStatus('ok', '✓ Neuer Stand gespeichert und per KI eingeordnet. Für alle anderen ist er in 1–2 Minuten sichtbar.');
+    } catch (e) {
+      zeigeStatus('fehler', `⚠ ${e.message.includes('<a ') ? e.message : esc(e.message)}`);
+    } finally {
+      uploadLaeuft = false;
+    }
+  }
+
+  function zeigeTokenDialog() {
+    const hat = !!speicher.get(TOKEN_SCHLUESSEL);
+    $('#listeTitel').textContent = 'Upload einrichten';
+    $('#listeInhalt').innerHTML = `<div class="anleitung">
+      <p>Damit ein hochgeladener Export für alle gespeichert und per KI eingeordnet wird, braucht dieser Browser einmalig einen GitHub-Token mit Schreibrecht <strong>nur für dieses Repo</strong>. Er wird nur in diesem Browser gespeichert.</p>
+      <ol>
+        <li><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Neuen „Fine-grained token“ anlegen</a>, Ablauf z. B. 1 Jahr</li>
+        <li><em>Repository access</em>: <strong>Only select repositories</strong> → <code>adric-board</code></li>
+        <li><em>Permissions</em>: <strong>Contents → Read and write</strong> und <strong>Actions → Read-only</strong></li>
+        <li><em>Generate token</em>, kopieren und hier einfügen:</li>
+      </ol>
+      <form class="token-form" id="tokenForm" autocomplete="off">
+        <input type="password" id="ghToken" placeholder="${hat ? 'Token ist hinterlegt – neuen einfügen zum Ersetzen' : 'github_pat_…'}" aria-label="GitHub-Token">
+        <button class="knopf" type="submit">Speichern</button>
+        ${hat ? '<button class="knopf leise" type="button" id="tokenWeg">Token entfernen</button>' : ''}
+      </form>
+      <div id="tokenMeldung" class="notiz-klein"></div></div>`;
+    $('#liste').showModal();
+    $('#tokenForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const t = $('#ghToken').value.trim();
+      if (!t) return;
+      const vorher = speicher.get(TOKEN_SCHLUESSEL);
+      speicher.set(TOKEN_SCHLUESSEL, t);
+      $('#tokenMeldung').textContent = 'Prüfe …';
+      try {
+        await github('');
+        await github(`/actions/workflows/${WORKFLOW}`);
+        $('#ghToken').value = '';
+        $('#tokenMeldung').textContent = '✓ Token funktioniert. Ab jetzt wird jeder Upload gespeichert und per KI eingeordnet.';
+        zeichne();
+      } catch (err) {
+        if (vorher) speicher.set(TOKEN_SCHLUESSEL, vorher); else speicher.weg(TOKEN_SCHLUESSEL);
+        $('#tokenMeldung').textContent = '⚠ ' + err.message;
+      }
+    });
+    $('#tokenWeg')?.addEventListener('click', () => { speicher.weg(TOKEN_SCHLUESSEL); $('#liste').close(); zeichne(); });
+  }
+  document.addEventListener('click', e => {
+    if (e.target.closest('#uploadEinrichten, [data-upload-einrichten]')) zeigeTokenDialog();
+  });
 
   /* ---------- Online-Daten: verschlüsselt, Passwort nötig ---------- */
   let paket = null;
@@ -1537,6 +1681,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   async function oeffne(passwortOderSchluessel, merken) {
     const { inhalt, schluessel } = await entschluessle(paket, passwortOderSchluessel);
+    zustand.schluessel = schluessel;
     if (merken) speicher.set(MERK_SCHLUESSEL, JSON.stringify({ salt: paket.salt, schluessel: b64(schluessel) }));
     zustand.online = inhalt;
     zustand.text = inhalt.csv;
@@ -1580,7 +1725,8 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   $('#sperren').addEventListener('click', () => {
     speicher.weg(MERK_SCHLUESSEL);
-    Object.assign(zustand, { text: null, ki: null, online: null, daten: null, dateiname: '', termineOhneAnruf: [], korrekturen: null });
+    Object.assign(zustand, { text: null, ki: null, online: null, daten: null, dateiname: '', termineOhneAnruf: [], korrekturen: null, schluessel: null });
+    $('#uploadStatus').hidden = true;
     $('#sperre').hidden = false;
     zeichne();
     $('#passwort').focus();
