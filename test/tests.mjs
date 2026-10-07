@@ -254,6 +254,12 @@ testA('Persona-Spalten werden gelesen, wenn vorhanden', async () => {
   assert.deepEqual(r.persona.rolle.map(x => [x.name, x.anrufe, x.gespraech]), [['Finanzleitung (CFO)', 1, 1], ['Einkauf / Procurement', 1, 0]]);
   assert.deepEqual(r.persona.branche.map(x => [x.name, x.anrufe, x.kontakte]), [['Maschinenbau', 2, 2]]);
 });
+testA('Jobtitel kommt über die Kontakt ID aus Zeilen ohne Notiz', async () => {
+  const t = 'Anrufnotizen,Contact job title,Aktivitätsdatum,Kontakt ID\n' +
+            '"gutes Gespräch",(Kein Wert),2026-09-29 05:00,7\n(Kein Wert),Head of Controlling,2026-09-20 05:00,7\n"Mailbox",(Kein Wert),2026-09-29 06:00,8\n';
+  const { anrufe: l } = A.leseAnrufe(t, 0);
+  assert.deepEqual(l.map(a => [a.kontaktId, a.jobtitel]), [['7', 'Head of Controlling'], ['8', '']]);
+});
 testA('KI-Eintrag mit veraltetem Notiz-Hash wird ignoriert', async () => {
   const { anrufe: liste } = A.leseAnrufe(csv, 5);
   A.wendeKiAn(liste, { '1001': { h: '00000000', ergebnis: 'gespraech', sicherheit: 1 } });

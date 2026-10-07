@@ -189,9 +189,9 @@ const SPALTEN = {
   engagementId: 'Engagement ID',
   kontaktId:    'Kontakt ID',
   // optional, für die Persona-Statistik (erste passende Bezeichnung zählt)
-  jobtitel:     ['Jobtitel', 'Job Title', 'Position', 'Berufsbezeichnung'],
-  branche:      ['Branche', 'Industry', 'Branche des Unternehmens'],
-  mitarbeiter:  ['Anzahl der Mitarbeiter', 'Anzahl Mitarbeiter', 'Number of Employees', 'Mitarbeiterzahl', 'Mitarbeiter'],
+  jobtitel:     ['Jobtitel', 'Job Title', 'Contact job title', 'Kontakt Jobtitel', 'Position', 'Berufsbezeichnung'],
+  branche:      ['Branche', 'Industry', 'Company industry', 'Unternehmen Branche', 'Branche des Unternehmens'],
+  mitarbeiter:  ['Anzahl der Mitarbeiter', 'Anzahl Mitarbeiter', 'Number of Employees', 'Company number of employees', 'Mitarbeiterzahl', 'Mitarbeiter'],
   abteilung:    ['Abteilung', 'Department'],
 };
 const PFLICHTSPALTEN = ['notiz', 'datum'];
@@ -201,12 +201,14 @@ const PFLICHTSPALTEN = ['notiz', 'datum'];
    der erste Treffer gewinnt (Teilwort, Groß-/Kleinschreibung egal).
    --------------------------------------------------------------------- */
 const ROLLEN = [
-  ['Finanzleitung (CFO)',      ['cfo', 'chief financial', 'head of finance', 'finanzleit', 'leiter finanz', 'leitung finanz', 'kaufmännische leit', 'kaufmännischer leit', 'kaufm. leit', 'finance director', 'director finance', 'vp finance', 'vice president finance', 'finanzvorstand', 'geschäftsführer finanzen']],
+  ['Finanzleitung (CFO)',      ['cfo', 'chief financial', 'head of finance', 'finanzleit', 'leiter finanz', 'leitung finanz', 'kaufmännisch', 'kaufm. leit', 'finance director', 'director finance', 'vp finance', 'vice president finance', 'finanzvorstand', 'geschäftsführer finanzen', 'corporate finance', 'treasury']],
   ['Controlling',              ['controll']],
   ['Buchhaltung / Kreditoren', ['buchhalt', 'accounting', 'rechnungswesen', 'kreditor', 'accounts payable', 'bilanz', 'finanzbuch', 'rechnungsprüf']],
-  ['Einkauf / Procurement',    ['einkauf', 'procurement', 'purchas', 'beschaffung', 'sourcing', 'cpo', 'buyer', 'supply chain']],
-  ['Geschäftsführung',         ['geschäftsführ', 'ceo', 'managing director', 'vorstand', 'inhaber', 'geschäftsleitung', ' coo ', 'president']],
-  ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ']],
+  ['Einkauf / Procurement',    ['einkauf', 'einkäufer', 'procurement', 'purchas', 'beschaffung', 'sourcing', 'cpo', 'buyer', 'category manag']],
+  ['Geschäftsführung',         ['geschäftsführ', 'ceo', 'chief executive', 'managing director', 'managing partner', 'vorstand', 'inhaber', 'geschäftsleit', ' coo ', 'chairman']],
+  ['Logistik / Supply Chain',  ['logisti', 'supply chain', 'transport']],
+  ['Innovation',               ['innovation', 'ideenmanag', 'incubation', 'research', 'forschung', 'r&d']],
+  ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ', ' ai ', 'automation']],
 ];
 const GROESSEN = [[0, '1–49'], [50, '50–249'], [250, '250–999'], [1000, '1.000–4.999'], [5000, '5.000+']];
 
@@ -480,6 +482,23 @@ function leseAnrufe(text, versatzStunden) {
       nummerTyp: nummernTyp(telefon),
       kategorie, treffer, termin,
     });
+  }
+  // HubSpot schreibt Jobtitel, Branche usw. oft nur in andere Zeilen desselben Kontakts
+  // (ohne Anrufnotiz). Über die Kontakt ID werden sie den Anrufen zugeordnet.
+  const PERSONA_FELDER = ['jobtitel', 'branche', 'mitarbeiter', 'abteilung'].filter(f => idx[f] >= 0);
+  if (PERSONA_FELDER.length && idx.kontaktId >= 0) {
+    const proKontakt = new Map();
+    for (let r = 1; r < zeilen.length; r++) {
+      const id = hole(zeilen[r], 'kontaktId');
+      if (!id) continue;
+      const e = proKontakt.get(id) || {};
+      for (const f of PERSONA_FELDER) if (!e[f]) { const v = hole(zeilen[r], f); if (v) e[f] = v; }
+      proKontakt.set(id, e);
+    }
+    for (const a of anrufe) {
+      const e = a.kontaktId && proKontakt.get(a.kontaktId);
+      if (e) for (const f of PERSONA_FELDER) if (!a[f] && e[f]) a[f] = e[f];
+    }
   }
   anrufe.sort((a, b) => a.zeit - b.zeit);
   return { anrufe, stat };
