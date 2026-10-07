@@ -30,7 +30,7 @@ const ENV_DATEI = process.env.ADRIC_ENV_DATEI || join(homedir(), 'adric job scra
 const KEYCHAIN = { dienst: 'adric-board-daten', konto: 'online' };
 const MODELLE = process.env.OPENAI_MODEL ? [process.env.OPENAI_MODEL] : ['gpt-5-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const STAPEL = 20;
-const PROMPT_VERSION = 2;          // erhöhen, wenn sich der Prompt ändert: dann wird neu eingeordnet
+const PROMPT_VERSION = 3;          // erhöhen, wenn sich der Prompt ändert: dann wird neu eingeordnet
 
 const html = readFileSync(join(WURZEL, 'index.html'), 'utf8');
 const A = new Function(html.match(/<script id="kern">([\s\S]*?)<\/script>/)[1] + '\nreturn ADRIC;')();
@@ -152,6 +152,16 @@ termin_gebucht: true NUR wenn in DIESEM Anruf ein Termin mit adric (Meeting, Cal
   false bei: "wollte keinen Termin", "schon vereinbart", "Termin konnte ich nicht ausmachen" –
   und bei RÜCKRUFEN: "morgen 15 Uhr nochmal anrufen", "will lieber 16.30 Uhr", "ruft zurück", "später nochmal probieren" sind KEINE Termine.
 interesse: hoch | mittel | keins | unklar  (nur bei gespraech sinnvoll, sonst unklar)
+einwand: Haupteinwand im Gespräch, genau einer (bei allem außer gespraech: keiner)
+  keiner             kein Einwand oder Termin/Interesse ohne Vorbehalt
+  schon_loesung      haben schon ein Tool/System/Dienstleister für Rechnungsprüfung
+  kein_bedarf        kein Bedarf, zu wenige Rechnungen/Abweichungen, passt nicht zum Geschäft
+  keine_zeit         keine Zeit, gerade schlecht, zu viele Projekte, später melden
+  nicht_zustaendig   nicht zuständig, verweist an andere Person/Abteilung
+  kein_budget        kein Budget, Sparkurs, Stellenabbau
+  will_unterlagen    will erst Unterlagen/Infos per Mail
+  gegen_kaltakquise  verärgert über Kaltakquise, fragt woher die Nummer, Datenschutz
+  sonstiges          anderer Einwand
 naechster_schritt: höchstens 8 Wörter, sonst ""
 sicherheit: 0.0 bis 1.0, wie sicher die Einordnung ist
 begruendung: höchstens 15 Wörter, ohne Namen und Telefonnummern`;
@@ -160,12 +170,13 @@ const SCHEMA = {
   type: 'object', additionalProperties: false, required: ['ergebnisse'],
   properties: { ergebnisse: { type: 'array', items: {
     type: 'object', additionalProperties: false,
-    required: ['id', 'ergebnis', 'termin_gebucht', 'interesse', 'naechster_schritt', 'sicherheit', 'begruendung'],
+    required: ['id', 'ergebnis', 'termin_gebucht', 'interesse', 'einwand', 'naechster_schritt', 'sicherheit', 'begruendung'],
     properties: {
       id: { type: 'string' },
       ergebnis: { type: 'string', enum: Object.keys(A.KI_ERGEBNISSE) },
       termin_gebucht: { type: 'boolean' },
       interesse: { type: 'string', enum: Object.keys(A.KI_INTERESSE) },
+      einwand: { type: 'string', enum: Object.keys(A.KI_EINWAENDE) },
       naechster_schritt: { type: 'string' },
       sicherheit: { type: 'number' },
       begruendung: { type: 'string' },
@@ -207,7 +218,7 @@ async function frageStapel(key, stapel) {
       const a = stapel[Number(e.id)];
       if (!a || !A.KI_ERGEBNISSE[e.ergebnis]) continue;
       cache[A.kiSchluessel(a)] = {
-        v: PROMPT_VERSION, h: A.notizHash(a.notiz), ergebnis: e.ergebnis, termin: e.termin_gebucht, interesse: e.interesse,
+        v: PROMPT_VERSION, h: A.notizHash(a.notiz), ergebnis: e.ergebnis, termin: e.termin_gebucht, interesse: e.interesse, einwand: e.einwand,
         schritt: e.naechster_schritt.slice(0, 80), sicherheit: Math.max(0, Math.min(1, e.sicherheit)),
         begruendung: e.begruendung.slice(0, 140),
       };

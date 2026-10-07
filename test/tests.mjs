@@ -222,6 +222,38 @@ testA('Korrektur von Hand markiert einen Anruf als Termin', async () => {
   const a = liste.find(x => x.engagementId === '1007'), b = liste.find(x => x.engagementId === '1010');
   assert.deepEqual([a.termin, a.manuell, b.termin], [true, true, false]);
 });
+testA('Persona: Rollen und Unternehmensgröße', async () => {
+  const r = A.rolleAus;
+  assert.equal(r('CFO'), 'Finanzleitung (CFO)');
+  assert.equal(r('Kaufmännischer Leiter'), 'Finanzleitung (CFO)');
+  assert.equal(r('Head of Controlling'), 'Controlling');
+  assert.equal(r('Leiterin Kreditorenbuchhaltung'), 'Buchhaltung / Kreditoren');
+  assert.equal(r('Strategic Purchasing Manager'), 'Einkauf / Procurement');
+  assert.equal(r('Geschäftsführer'), 'Geschäftsführung');
+  assert.equal(r('Head of IT'), 'IT / Digitalisierung');
+  assert.equal(r('Leiter Geschäftseinheit'), 'Sonstige');
+  assert.equal(r('Product Owner'), 'Sonstige');
+  assert.equal(r(''), 'Unbekannt');
+  assert.deepEqual(['1,001-5,000', '250', '5.000+', '10000', 'k. A.'].map(A.groesseAus), ['1.000–4.999', '250–999', '5.000+', '5.000+', 'Unbekannt']);
+});
+testA('Kontakte: Versuche bis zum ersten Gespräch', async () => {
+  const { anrufe: liste } = A.leseAnrufe(csv, 5);
+  const r = A.auswerten(liste, null, null);
+  const anna = r.kontaktListe.find(k => k.name === 'Anna Müller');     // 3 Versuche, nie erreicht
+  const udo = r.kontaktListe.find(k => k.name === 'Udo Klein');        // Gespräch im 1. Versuch, dann Mailbox
+  assert.deepEqual([anna.versuche, anna.gespraeche, anna.bisGespraech], [3, 0, null]);
+  assert.deepEqual([udo.versuche, udo.bisGespraech], [2, 1]);
+  assert.equal(r.kontaktListe.length, 14);
+  assert.equal(r.hatPersona, false);
+});
+testA('Persona-Spalten werden gelesen, wenn vorhanden', async () => {
+  const t = 'Anrufnotizen;Aktivitätsdatum;Job Title;Branche;Anzahl der Mitarbeiter;Kontakt ID\n' +
+            'gutes Gespräch;2026-09-29 05:00;CFO;Maschinenbau;1,001-5,000;1\nMailbox;2026-09-29 06:00;Einkaufsleiter;Maschinenbau;300;2\n';
+  const r = A.auswerten(A.leseAnrufe(t, 0).anrufe, null, null);
+  assert.equal(r.hatPersona, true);
+  assert.deepEqual(r.persona.rolle.map(x => [x.name, x.anrufe, x.gespraech]), [['Finanzleitung (CFO)', 1, 1], ['Einkauf / Procurement', 1, 0]]);
+  assert.deepEqual(r.persona.branche.map(x => [x.name, x.anrufe, x.kontakte]), [['Maschinenbau', 2, 2]]);
+});
 testA('KI-Eintrag mit veraltetem Notiz-Hash wird ignoriert', async () => {
   const { anrufe: liste } = A.leseAnrufe(csv, 5);
   A.wendeKiAn(liste, { '1001': { h: '00000000', ergebnis: 'gespraech', sicherheit: 1 } });

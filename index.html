@@ -188,8 +188,27 @@ const SPALTEN = {
   vorname:      'Vorname',
   engagementId: 'Engagement ID',
   kontaktId:    'Kontakt ID',
+  // optional, für die Persona-Statistik (erste passende Bezeichnung zählt)
+  jobtitel:     ['Jobtitel', 'Job Title', 'Position', 'Berufsbezeichnung'],
+  branche:      ['Branche', 'Industry', 'Branche des Unternehmens'],
+  mitarbeiter:  ['Anzahl der Mitarbeiter', 'Anzahl Mitarbeiter', 'Number of Employees', 'Mitarbeiterzahl', 'Mitarbeiter'],
+  abteilung:    ['Abteilung', 'Department'],
 };
 const PFLICHTSPALTEN = ['notiz', 'datum'];
+
+/* ---------------------------------------------------------------------
+   PERSONA: Jobtitel → Rollengruppe. Geprüft wird von oben nach unten,
+   der erste Treffer gewinnt (Teilwort, Groß-/Kleinschreibung egal).
+   --------------------------------------------------------------------- */
+const ROLLEN = [
+  ['Finanzleitung (CFO)',      ['cfo', 'chief financial', 'head of finance', 'finanzleit', 'leiter finanz', 'leitung finanz', 'kaufmännische leit', 'kaufmännischer leit', 'kaufm. leit', 'finance director', 'director finance', 'vp finance', 'vice president finance', 'finanzvorstand', 'geschäftsführer finanzen']],
+  ['Controlling',              ['controll']],
+  ['Buchhaltung / Kreditoren', ['buchhalt', 'accounting', 'rechnungswesen', 'kreditor', 'accounts payable', 'bilanz', 'finanzbuch', 'rechnungsprüf']],
+  ['Einkauf / Procurement',    ['einkauf', 'procurement', 'purchas', 'beschaffung', 'sourcing', 'cpo', 'buyer', 'supply chain']],
+  ['Geschäftsführung',         ['geschäftsführ', 'ceo', 'managing director', 'vorstand', 'inhaber', 'geschäftsleitung', ' coo ', 'president']],
+  ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ']],
+];
+const GROESSEN = [[0, '1–49'], [50, '50–249'], [250, '250–999'], [1000, '1.000–4.999'], [5000, '5.000+']];
 
 // Deutsche Mobilfunk-Vorwahlen ohne führende 0 (also 015x, 016x, 017x)
 const MOBIL_VORWAHLEN = ['15', '16', '17'];
@@ -224,6 +243,18 @@ const KI_ERGEBNISSE = {
   abwesend:          { gruppe: 'falsch',    label: 'Abwesend' },
 };
 const KI_INTERESSE = { hoch: 'Hohes Interesse', mittel: 'Mittleres Interesse', keins: 'Kein Interesse', unklar: 'Unklar' };
+// Haupteinwand im Gespräch (nur bei Gesprächen, von der KI eingeordnet)
+const KI_EINWAENDE = {
+  keiner:            'Kein Einwand',
+  schon_loesung:     'Haben schon eine Lösung',
+  kein_bedarf:       'Kein Bedarf / zu wenig Volumen',
+  keine_zeit:        'Keine Zeit / falscher Zeitpunkt',
+  nicht_zustaendig:  'Nicht zuständig',
+  kein_budget:       'Kein Budget',
+  will_unterlagen:   'Erst Unterlagen per Mail',
+  gegen_kaltakquise: 'Gegen Kaltakquise / Datenschutz',
+  sonstiges:         'Sonstiges',
+};
 const KI_MINDEST_SICHERHEIT = 0.6;
 
 /* =====================================================================
@@ -390,8 +421,12 @@ function isoTag(d) {
 function spaltenIndex(kopf) {
   const norm = kopf.map(k => normalisiere(k).toLowerCase());
   const idx = {};
-  for (const [schluessel, name] of Object.entries(SPALTEN)) {
-    idx[schluessel] = norm.indexOf(name.normalize('NFC').toLowerCase());
+  for (const [schluessel, namen] of Object.entries(SPALTEN)) {
+    idx[schluessel] = -1;
+    for (const name of [].concat(namen)) {
+      const i = norm.indexOf(name.normalize('NFC').toLowerCase());
+      if (i >= 0) { idx[schluessel] = i; break; }
+    }
   }
   const fehlend = PFLICHTSPALTEN.filter(k => idx[k] < 0).map(k => SPALTEN[k]);
   return { idx, fehlend };
@@ -434,6 +469,10 @@ function leseAnrufe(text, versatzStunden) {
       vorname: hole(z, 'vorname'),
       nachname: hole(z, 'nachname'),
       kontaktId: hole(z, 'kontaktId'),
+      jobtitel: hole(z, 'jobtitel'),
+      branche: hole(z, 'branche'),
+      mitarbeiter: hole(z, 'mitarbeiter'),
+      abteilung: hole(z, 'abteilung'),
       zeit,
       tag: isoTag(zeit),
       wochentag: (zeit.getUTCDay() + 6) % 7,   // 0 = Montag
@@ -492,6 +531,22 @@ function mitQuote(topf) {
   return topf;
 }
 
+function rolleAus(jobtitel) {
+  const t = ' ' + normalisiere(jobtitel).toLowerCase() + ' ';
+  if (!t.trim()) return 'Unbekannt';
+  for (const [rolle, woerter] of ROLLEN) if (woerter.some(w => t.includes(w))) return rolle;
+  return 'Sonstige';
+}
+// "1,001-5,000", "1001 - 5000", "250", "5.000+" → Größenklasse nach der ersten Zahl
+function groesseAus(text) {
+  const m = normalisiere(text).replace(/(\d)[.,](\d{3})/g, '$1$2').match(/\d+/);
+  if (!m) return 'Unbekannt';
+  const n = Number(m[0]);
+  let label = GROESSEN[0][1];
+  for (const [ab, l] of GROESSEN) if (n >= ab) label = l;
+  return label;
+}
+
 function kontaktSchluessel(a) {
   if (a.kontaktId) return 'id:' + a.kontaktId;
   const name = `${a.vorname} ${a.nachname}`.trim().toLowerCase();
@@ -516,6 +571,10 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
   const heat = WOCHENTAGE.map(() => Array.from({ length: 24 }, () => leererTopf()));
   const details = {};
   const interesse = {};
+  const einwaende = {};
+  const proKontakt = new Map();
+  const persona = { rolle: new Map(), branche: new Map(), groesse: new Map() };
+  const personaTopf = (map, k) => { if (!map.has(k)) map.set(k, Object.assign(leererTopf(), { name: k, kontakte: new Set() })); return map.get(k); };
 
   for (const a of anrufe) {
     zaehle(gesamt, a);
@@ -523,6 +582,21 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     const det = a.detail || a.kategorie;
     details[det] = (details[det] || 0) + 1;
     if (a.kategorie === 'gespraech' && a.interesse) interesse[a.interesse] = (interesse[a.interesse] || 0) + 1;
+    if (a.einwand) einwaende[a.einwand] = (einwaende[a.einwand] || 0) + 1;
+    const kk = kontaktSchluessel(a);
+    if (kk) {
+      if (!proKontakt.has(kk)) proKontakt.set(kk, { name: `${a.vorname} ${a.nachname}`.trim() || '–', firma: a.firma, versuche: 0, gespraeche: 0, termin: false, bisGespraech: null, letzter: a });
+      const k = proKontakt.get(kk);
+      k.versuche++;
+      if (a.kategorie === 'gespraech') { k.gespraeche++; if (k.bisGespraech == null) k.bisGespraech = k.versuche; }
+      if (a.termin) k.termin = true;
+      k.letzter = a;                                   // Anrufe sind chronologisch sortiert
+    }
+    for (const [map, wert] of [[persona.rolle, rolleAus(a.jobtitel)], [persona.branche, a.branche || 'Unbekannt'], [persona.groesse, groesseAus(a.mitarbeiter)]]) {
+      const t = personaTopf(map, wert);
+      zaehle(t, a);
+      if (kk) t.kontakte.add(kk);
+    }
     const ks = kontaktSchluessel(a);
     if (ks) kontakte.add(ks);
     if (a.firma) {
@@ -561,6 +635,12 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     heat: heat.map(zeile => zeile.map(mitQuote)),
     details,                       // Ergebnis -> Anzahl (KI-Ergebnis oder Regel-Gruppe)
     interesse,                     // nur Gespräche mit KI-Einschätzung
+    einwaende,                     // Haupteinwand je Gespräch (KI)
+    kontaktListe: [...proKontakt.values()],
+    hatPersona: anrufe.some(a => a.jobtitel || a.branche || a.mitarbeiter),
+    persona: Object.fromEntries(Object.entries(persona).map(([art, map]) => [art,
+      [...map.values()].map(t => mitQuote(Object.assign(t, { kontakte: t.kontakte.size, erreichtQuote: t.anrufe ? (t.anrufe - t.niemand) / t.anrufe : null })))
+        .sort((x, y) => (x.name === 'Unbekannt') - (y.name === 'Unbekannt') || y.anrufe - x.anrufe)])),
     kiAnzahl: anrufe.filter(a => a.quelle === 'ki').length,
     unsicher: anrufe.filter(a => a.ki && a.quelle !== 'ki'),
     uneinig: anrufe.filter(a => a.uneinig),
@@ -600,6 +680,7 @@ function wendeKiAn(anrufe, ki) {
     a.termin = gruppe === 'gespraech' && !!k.termin;
     a.interesse = gruppe === 'gespraech' ? k.interesse : null;
     a.schritt = k.schritt || '';
+    a.einwand = gruppe === 'gespraech' && KI_EINWAENDE[k.einwand] ? k.einwand : null;
   }
   return anrufe;
 }
@@ -708,9 +789,11 @@ async function verschluessleMitSchluessel(klartext, roh, saltB64, runden = PBKDF
 
 // Nur die Anrufzeilen im Original-Spaltenformat – so klein wie möglich für Upload und Online-Daten
 function alsAnrufCsv(anrufe) {
-  const kopf = ['Anrufnotizen', 'Telefonnummer', 'Aktivitätsdatum', 'Unternehmensname', 'Nachname', 'Vorname', 'Engagement ID', 'Kontakt ID'];
+  const kopf = ['Anrufnotizen', 'Telefonnummer', 'Aktivitätsdatum', 'Unternehmensname', 'Nachname', 'Vorname', 'Engagement ID', 'Kontakt ID',
+                'Jobtitel', 'Branche', 'Anzahl der Mitarbeiter', 'Abteilung'];
   const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-  return [kopf, ...anrufe.map(a => [a.notiz, a.telefon, a.datumRoh, a.firma, a.nachname, a.vorname, a.engagementId, a.kontaktId])]
+  return [kopf, ...anrufe.map(a => [a.notiz, a.telefon, a.datumRoh, a.firma, a.nachname, a.vorname, a.engagementId, a.kontaktId,
+    a.jobtitel, a.branche, a.mitarbeiter, a.abteilung])]
     .map(z => z.map(q).join(',')).join('\n') + '\n';
 }
 
@@ -733,7 +816,7 @@ const ADRIC = {
   STANDARD_STUNDENVERSATZ, MINDEST_STICHPROBE, KATEGORIEN, NUMMERNTYPEN, WOCHENTAGE,
   parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
   leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
-  KI_ERGEBNISSE, KI_INTERESSE, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
+  KI_ERGEBNISSE, KI_INTERESSE, KI_EINWAENDE, ROLLEN, rolleAus, groesseAus, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
   entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, verschluessleMitSchluessel, entschluessle, b64, unb64, alsAnrufCsv,
 };
 </script>
@@ -987,6 +1070,24 @@ dialog.liste .kopfzeile { position: sticky; top: 0; z-index: 1; display: flex; j
 dialog.liste .kopfzeile h3 { margin: 0; font-size: 18px; }
 dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(86vh - 70px); }
 
+/* Summary, Erkenntnisse, Kontakte, Persona */
+.summary-text { font-size: 17px; line-height: 1.6; margin: 0 0 16px; }
+.summary-text strong { font-family: var(--mono); }
+.erkenntnisse { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.erkenntnisse li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; align-items: start; padding: 12px 14px; border-radius: 12px;
+  background: var(--card); border: 1px solid var(--line); font-size: 14px; }
+.erkenntnisse .ic { font-size: 18px; line-height: 1.2; }
+.erkenntnisse .basis { color: var(--muted); font-size: 12.5px; }
+.zwischentitel { font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 18px 0 10px; font-weight: 700; }
+.mini-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+.mini-kpis > div { padding: 12px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); }
+.mini-kpis .w { font-family: var(--mono); font-weight: 800; font-size: 24px; line-height: 1.1; }
+.mini-kpis .t { font-size: 12px; color: var(--muted); }
+.persona-raster { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.persona-raster > :first-child { grid-column: 1 / -1; }
+.hinweis-box { padding: 14px 16px; border-radius: 12px; border: 1px dashed var(--line-2); color: var(--ink-2); font-size: 14px; line-height: 1.6; }
+@media (max-width: 760px) { .mini-kpis { grid-template-columns: 1fr 1fr; } .persona-raster { grid-template-columns: 1fr; } }
+
 /* Upload-Status */
 .upload-status { display: flex; gap: 12px; align-items: center; padding: 12px 16px; margin-bottom: 14px; border-radius: 14px;
   border: 1px solid var(--line-2); background: var(--card); font-size: 14px; }
@@ -1119,6 +1220,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     <section class="card hinweis-leer" id="leer" hidden></section>
     <div id="auswertungen">
       <div class="grid">
+        <section class="card voll auftritt"><h2>Wochen-Summary <span class="h2-zusatz" id="summaryZusatz"></span></h2><div id="summary"></div></section>
         <section class="card auftritt"><h2>Trichter <span class="h2-zusatz">vom Wählen bis zum Termin</span></h2><div id="trichter"></div></section>
         <section class="card auftritt"><h2>Ergebnis der Anrufe <span class="h2-zusatz" id="ergebnisZusatz"></span></h2><div id="ergebnis"></div></section>
         <section class="card voll auftritt"><h2>Wann erreicht man wen? <span class="h2-zusatz" id="heatZusatz"></span></h2><div id="heat"></div></section>
@@ -1127,6 +1229,9 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <section class="card auftritt"><h2>Nach Nummerntyp</h2><div id="proNummer"></div></section>
         <section class="card auftritt"><h2>Pro Wochentag</h2><div id="proWochentag"></div></section>
         <section class="card auftritt"><h2>Pro Stunde <span class="h2-zusatz" id="stundeZusatz"></span></h2><div id="proStunde"></div></section>
+        <section class="card auftritt"><h2>Kontakte <span class="h2-zusatz">Versuche bis zum Gespräch</span></h2><div id="kontakte"></div></section>
+        <section class="card auftritt"><h2>Einwände im Gespräch <span class="h2-zusatz" id="einwandZusatz"></span></h2><div id="einwaende"></div></section>
+        <section class="card voll auftritt"><h2>Persona <span class="h2-zusatz">Wer ist erreichbar, wer spricht, wer bucht?</span></h2><div id="persona"></div></section>
         <section class="card voll auftritt" id="uneinigKarte"></section>
         <section class="card voll auftritt"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
         <section class="card voll auftritt"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
@@ -1258,6 +1363,68 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     const d = jetzt - vorher;
     const klasse = d > 0 ? 'hoch' : d < 0 ? 'runter' : 'gleich';
     return `<span class="delta ${klasse}" title="Vergleich mit ${esc(name)}: ${vorher}">${d > 0 ? '▲' : d < 0 ? '▼' : '='} ${Math.abs(d)} ggü. ${esc(name)}</span>`;
+  }
+
+  /* ---------- Wochen-Summary und Erkenntnisse ---------- */
+  function summaryText(r, v, vName, termineGesamt) {
+    const g = r.gesamt;
+    const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    const kl = r.kontaktListe, mitG = kl.filter(k => k.gespraeche).length;
+    let t = `<strong>${zahl(g.anrufe)}</strong> Anrufe an <strong>${zahl(r.telefontage)}</strong> Telefontag${r.telefontage === 1 ? '' : 'en'} (Ø ${proTag}), ` +
+      `<strong>${zahl(g.gespraech)}</strong> Gespräche (${prozent(g.quote)}${g.kleineStichprobe ? ', Stichprobe klein' : ''}) und <strong>${zahl(termineGesamt)}</strong> Termin${termineGesamt === 1 ? '' : 'e'}. ` +
+      `${zahl(kl.length)} Kontakte bei ${zahl(r.firmen)} Firmen angerufen, ${zahl(mitG)} davon gesprochen.`;
+    if (v && v.gesamt.anrufe) {
+      const d = (a, b) => (a - b > 0 ? '+' : a - b < 0 ? '−' : '±') + Math.abs(a - b);
+      t += ` Gegenüber ${esc(vName)}: Anrufe ${d(g.anrufe, v.gesamt.anrufe)}, Gespräche ${d(g.gespraech, v.gesamt.gespraech)}, Termine ${d(termineGesamt, v.gesamt.termin + v.termineOhneAnruf.length)}.`;
+    }
+    const niemand = Object.entries(r.details).filter(([k]) => gruppeErgebnis(k) === 'niemand' && KI_ERGEBNISSE[k]).sort((a, b) => b[1] - a[1])[0];
+    if (niemand && g.anrufe) t += ` Häufigster Grund, niemanden zu sprechen: <em>${esc(labelErgebnis(niemand[0]))}</em> (${prozent(niemand[1] / g.anrufe)} der Anrufe).`;
+    return t;
+  }
+
+  // Nur Aussagen aus mindestens MINDEST_STICHPROBE Fällen; sonst lieber nichts sagen
+  function erkenntnisseHtml(a) {
+    const g = a.gesamt, liste = [], n = MINDEST_STICHPROBE;
+    const vergleich = (eintraege, name) => {
+      const ok = eintraege.filter(e => e.t.anrufe >= n);
+      if (ok.length < 2) return;
+      ok.sort((x, y) => y.t.quote - x.t.quote);
+      const b = ok[0], s = ok[ok.length - 1];
+      if (b.t.quote - s.t.quote < 0.08) return;
+      liste.push(['🕘', `Beste${name}: <strong>${esc(b.label)}</strong> mit ${prozent(b.t.quote)} Gesprächen, schwächste: ${esc(s.label)} mit ${prozent(s.t.quote)}.`,
+        `n = ${b.t.anrufe} bzw. ${s.t.anrufe} Anrufe`]);
+    };
+    vergleich(a.proStunde.map(t => ({ label: `${String(t.stunde).padStart(2, '0')}–${String(t.stunde + 1).padStart(2, '0')} Uhr`, t })), ' Uhrzeit');
+    vergleich(a.proWochentag.map(t => ({ label: t.label, t })), 'r Wochentag');
+    const mob = a.proNummerTyp.find(t => t.typ === 'mobil'), fest = a.proNummerTyp.find(t => t.typ === 'festnetz');
+    if (mob.anrufe >= n && fest.anrufe >= n && Math.abs(mob.quote - fest.quote) >= 0.05) {
+      const besser = mob.quote > fest.quote ? 'Mobilnummern' : 'Festnetz/Durchwahlen';
+      liste.push(['📱', `<strong>${besser}</strong> bringen mehr Gespräche: Mobil ${prozent(mob.quote)}, Festnetz ${prozent(fest.quote)}.`, `n = ${mob.anrufe} / ${fest.anrufe}`]);
+    }
+    const blockiert = (a.details.zentrale_blockt || 0) + (a.details.nummer_ungueltig || 0);
+    if (g.anrufe >= n && blockiert / g.anrufe >= 0.12) {
+      liste.push(['☎️', `Bei <strong>${prozent(blockiert / g.anrufe)}</strong> der Anrufe blockt die Zentrale oder die Nummer stimmt nicht. Bessere Nummern (Durchwahl, Mobil) vor dem Anruf zu recherchieren, lohnt sich.`, `n = ${blockiert} von ${g.anrufe}`]);
+    }
+    const kl = a.kontaktListe, mitG = kl.filter(k => k.gespraeche), bis = mitG.map(k => k.bisGespraech);
+    if (mitG.length >= n) {
+      const nachErstem = bis.filter(x => x > 1).length;
+      liste.push(['🔁', `<strong>${prozent(nachErstem / mitG.length)}</strong> der Gespräche kamen erst ab dem 2. Versuch zustande. Dranbleiben lohnt sich, ${zahl(kl.filter(k => !k.gespraeche && k.versuche >= 3).length)} Kontakte stehen bei 3+ Versuchen ohne Gespräch.`, `n = ${mitG.length} Kontakte mit Gespräch`]);
+    }
+    const ew = Object.entries(a.einwaende).filter(([k]) => k !== 'keiner').sort((x, y) => y[1] - x[1]);
+    const ewSumme = Object.values(a.einwaende).reduce((x, y) => x + y, 0);
+    if (ewSumme >= n && ew.length) {
+      liste.push(['🧱', `Häufigster Einwand: <strong>${esc(KI_EINWAENDE[ew[0][0]])}</strong> (${prozent(ew[0][1] / ewSumme)} der Gespräche)` +
+        (ew[1] ? `, danach ${esc(KI_EINWAENDE[ew[1][0]])} (${prozent(ew[1][1] / ewSumme)}).` : '.') + ' Dafür lohnt sich eine vorbereitete Antwort.', `n = ${ewSumme} Gespräche`]);
+    }
+    if (g.gespraech >= n) {
+      liste.push(['🎯', `Aus <strong>${zahl(g.gespraech)}</strong> Gesprächen wurden <strong>${zahl(g.termin)}</strong> Termine (${prozent(g.terminQuote)}). Auf ein Gespräch kommen ${zahl(Math.round(g.anrufe / g.gespraech * 10) / 10)} Anrufe.`, `n = ${g.gespraech} Gespräche`]);
+    }
+    if (a.hatPersona) {
+      const rollen = a.persona.rolle.filter(t => t.anrufe >= n && t.name !== 'Unbekannt').sort((x, y) => y.quote - x.quote);
+      if (rollen.length >= 2) liste.push(['👤', `Rolle mit der höchsten Gesprächsquote: <strong>${esc(rollen[0].name)}</strong> (${prozent(rollen[0].quote)}), niedrigste: ${esc(rollen[rollen.length - 1].name)} (${prozent(rollen[rollen.length - 1].quote)}).`, `n = ${rollen[0].anrufe} / ${rollen[rollen.length - 1].anrufe}`]);
+    }
+    if (!liste.length) return '<p class="notiz-klein">Noch zu wenig Daten für belastbare Erkenntnisse (je Aussage mindestens 10 Fälle).</p>';
+    return `<ul class="erkenntnisse">${liste.map(([ic, text, basis]) => `<li><span class="ic" aria-hidden="true">${ic}</span><div>${text}<div class="basis">${esc(basis)}</div></div></li>`).join('')}</ul>`;
   }
 
   /* ---------- Board zeichnen ---------- */
@@ -1408,6 +1575,60 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     $('#proNummer').innerHTML = reihen(r.proNummerTyp.filter(t => t.anrufe).map(t => ({ label: t.label, t })))
       + `<p class="notiz-klein">Mobil = deutsche Nummer mit 015, 016 oder 017. Festnetz = andere deutsche Nummer.</p>`;
 
+    // Wochen-Summary (gewählter Zeitraum) und Erkenntnisse (alle Daten, robuster)
+    const alle = (zustand.von || zustand.bis) ? auswerten(d.anrufe, null, null, zustand.termineOhneAnruf) : r;
+    $('#summaryZusatz').textContent = zeitraumBeschriftung(zustand.von, zustand.bis);
+    $('#summary').innerHTML = `<p class="summary-text">${summaryText(r, v, vName, termineGesamt)}</p>
+      <div class="zwischentitel">Was man daraus lernen kann <span style="text-transform:none;letter-spacing:0;font-weight:400">· aus allen ${zahl(alle.gesamt.anrufe)} Anrufen</span></div>
+      ${erkenntnisseHtml(alle)}`;
+
+    // Kontakte
+    const kl = r.kontaktListe, mitG = kl.filter(k => k.gespraeche);
+    const versucheBis = mitG.map(k => k.bisGespraech);
+    const offen3 = kl.filter(k => !k.gespraeche && k.versuche >= 3);
+    const stufenBis = [['1. Versuch', versucheBis.filter(n => n === 1).length], ['2. Versuch', versucheBis.filter(n => n === 2).length],
+      ['3. Versuch', versucheBis.filter(n => n === 3).length], ['4.+ Versuch', versucheBis.filter(n => n >= 4).length]];
+    const maxBis = Math.max(1, ...stufenBis.map(x => x[1]));
+    const schnitt = arr => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    $('#kontakte').innerHTML = `<div class="mini-kpis">
+        <div data-liste="kontakte"><div class="w">${zahl(kl.length)}</div><div class="t">Kontakte angerufen</div></div>
+        <div data-liste="kontakte-gespraech"><div class="w">${zahl(mitG.length)}</div><div class="t">mit Gespräch (${prozent(kl.length ? mitG.length / kl.length : null)})</div></div>
+        <div><div class="w">${schnitt(kl.map(k => k.versuche))}</div><div class="t">Ø Versuche je Kontakt</div></div>
+        <div><div class="w">${schnitt(versucheBis)}</div><div class="t">Ø Versuche bis Gespräch</div></div></div>
+      <div class="zwischentitel">Gespräch kam zustande beim …</div>
+      ${stufenBis.map(([l, n]) => `<div class="vert"><span>${l}</span><div class="spur"><i class="f-gespraech" style="width:${(n / maxBis * 100).toFixed(1)}%"></i></div>
+        <span class="n num">${zahl(n)}</span><span class="p num">${prozent(mitG.length ? n / mitG.length : null)}</span></div>`).join('')}
+      ${mitG.length && mitG.length < MINDEST_STICHPROBE ? '<p class="notiz-klein">' + kleinHinweis(mitG.length) + '</p>' : ''}
+      <p class="notiz-klein" data-liste="kontakte-offen" style="cursor:pointer">→ <strong>${zahl(offen3.length)} Kontakte</strong> wurden 3-mal oder öfter ohne Gespräch angerufen. Liste anzeigen</p>`;
+
+    // Einwände
+    const ew = Object.entries(r.einwaende).filter(([k]) => k !== 'keiner').sort((a, b) => b[1] - a[1]);
+    const ewSumme = Object.values(r.einwaende).reduce((a, b) => a + b, 0);
+    $('#einwandZusatz').textContent = ewSumme ? `${zahl(ewSumme)} Gespräche eingeordnet` : '';
+    $('#einwaende').innerHTML = !ewSumme
+      ? '<p class="notiz-klein">Erscheint nach der nächsten KI-Einordnung (neuer Upload oder Update-Skript).</p>'
+      : ew.map(([k, n]) => `<div class="vert" data-liste="einwand:${esc(k)}" title="Gespräche anzeigen"><span>${esc(KI_EINWAENDE[k])}</span>
+          <div class="spur"><i class="f-falsch" style="width:${(n / ew[0][1] * 100).toFixed(1)}%"></i></div>
+          <span class="n num">${zahl(n)}</span><span class="p num">${prozent(n / ewSumme)}</span></div>`).join('') +
+        `<p class="notiz-klein">${zahl(r.einwaende.keiner || 0)} Gespräche ohne Einwand. Anteile bezogen auf alle eingeordneten Gespräche${ewSumme < MINDEST_STICHPROBE ? ' · ' + kleinHinweis(ewSumme) : ''}.</p>`;
+
+    // Persona
+    const personaTabelle = (titel, art, liste) => `<div><div class="zwischentitel">${titel}</div>
+      <table class="tabelle firmen"><thead><tr><th>${titel}</th><th class="num neben">Kontakte</th><th class="num">Anrufe</th><th class="num">Erreicht</th><th class="num">Gespräch</th><th class="num">Termine</th><th></th></tr></thead>
+      <tbody>${liste.map(t => `<tr data-liste="${art}:${esc(t.name)}">
+        <td>${esc(t.name)}</td><td class="num neben">${zahl(t.kontakte)}</td><td class="num">${zahl(t.anrufe)}</td>
+        <td class="num${t.kleineStichprobe ? ' quote-unsicher' : ''}">${prozent(t.erreichtQuote)}</td>
+        <td class="num${t.kleineStichprobe ? ' quote-unsicher' : ''}">${prozent(t.quote)}</td>
+        <td class="num">${t.termin ? zahl(t.termin) : '–'}</td><td>${t.kleineStichprobe ? kleinHinweis(t.anrufe) : ''}</td></tr>`).join('')}</tbody></table></div>`;
+    $('#persona').innerHTML = r.hatPersona
+      ? `<div class="persona-raster">${personaTabelle('Rolle', 'rolle', r.persona.rolle)}${personaTabelle('Unternehmensgröße', 'groesse', r.persona.groesse)}${personaTabelle('Branche', 'branche', r.persona.branche.slice(0, 10))}</div>
+         <p class="notiz-klein">Rolle aus dem Jobtitel (Stichwortliste ROLLEN oben in index.html). „Erreicht“ = jemand abgenommen, „Gespräch“ = inhaltlich gesprochen.</p>`
+      : `<div class="hinweis-box"><strong>Für die Persona-Auswertung fehlen im HubSpot-Export noch Spalten.</strong><br>
+          Im HubSpot-Bericht „Anrufsnotizen“ unter <em>Bearbeiten</em> diese Eigenschaften hinzufügen, speichern und neu exportieren:<br>
+          · Kontakt: <strong>Jobtitel</strong> (optional <strong>Abteilung</strong>)<br>
+          · Unternehmen: <strong>Branche</strong> und <strong>Anzahl der Mitarbeiter</strong><br>
+          Danach zeigt diese Karte Erreichbarkeit, Gesprächs- und Terminquote je Rolle, Unternehmensgröße und Branche.</div>`;
+
     // KI und Regeln uneinig
     $('#uneinigKarte').hidden = !mitKi;
     if (mitKi) {
@@ -1475,6 +1696,15 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       html = `<table class="tabelle firmen"><thead><tr><th>Firma</th><th class="num">Anrufe</th><th class="num">Gespräche</th><th class="num">Termine</th><th class="num neben">Kontakte</th></tr></thead>
         <tbody>${r.topFirmen.map(f => `<tr><td>${esc(f.name)}</td><td class="num">${zahl(f.anrufe)}</td><td class="num">${zahl(f.gespraech)}</td>
         <td class="num">${f.termin ? zahl(f.termin) : '–'}</td><td class="num neben">${zahl(f.kontakte)}</td></tr>`).join('')}</tbody></table>`;
+    } else if (schluessel === 'kontakte-offen' || schluessel === 'kontakte-gespraech') {
+      const offen = schluessel === 'kontakte-offen';
+      const liste = r.kontaktListe.filter(k => offen ? (!k.gespraeche && k.versuche >= 3) : k.gespraeche).sort((x, y) => y.versuche - x.versuche);
+      titel = offen ? `${zahl(liste.length)} Kontakte mit 3+ Versuchen ohne Gespräch` : `${zahl(liste.length)} Kontakte mit Gespräch`;
+      html = liste.length ? `<table class="tabelle firmen"><thead><tr><th>Kontakt</th><th class="num">Versuche</th><th class="num">${offen ? 'Gespräche' : 'Gespräch beim'}</th><th class="neben">Zuletzt</th></tr></thead>
+        <tbody>${liste.map(k => `<tr><td><strong>${esc(k.name)}</strong><div class="klein-text">${esc(k.firma || '–')}</div></td>
+          <td class="num">${zahl(k.versuche)}</td><td class="num">${offen ? '–' : zahl(k.bisGespraech) + '. Versuch'}</td>
+          <td class="neben klein-text">${tagKurz(k.letzter.tag)} · ${esc(labelErgebnis(k.letzter.detail || k.letzter.kategorie))}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="notiz-klein">Keine Einträge.</p>';
     } else if (schluessel === 'kontakte') {
       const map = new Map();
       for (const a of r.anrufe) {
@@ -1501,7 +1731,15 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         termine: [`Termine aus Anrufen`, r.termine],
       }[schluessel];
       if (filter) [titel, html] = [filter[0], anrufTabelle(filter[1])];
-      else if (schluessel.startsWith('detail:')) {
+      else if (schluessel.startsWith('einwand:')) {
+        const k = schluessel.slice(8), liste = r.gespraeche.filter(a => a.einwand === k);
+        [titel, html] = [`Einwand: ${KI_EINWAENDE[k] || k} · ${zahl(liste.length)}`, anrufTabelle(liste)];
+      } else if (/^(rolle|branche|groesse):/.test(schluessel)) {
+        const [art, ...rest] = schluessel.split(':'), wert = rest.join(':');
+        const passt = { rolle: a => rolleAus(a.jobtitel) === wert, branche: a => (a.branche || 'Unbekannt') === wert, groesse: a => groesseAus(a.mitarbeiter) === wert }[art];
+        const liste = r.anrufe.filter(passt);
+        [titel, html] = [`${wert} · ${zahl(liste.length)} Anrufe`, anrufTabelle(liste)];
+      } else if (schluessel.startsWith('detail:')) {
         const k = schluessel.slice(7);
         const liste = r.anrufe.filter(a => (a.detail || a.kategorie) === k);
         [titel, html] = [`${labelErgebnis(k)} · ${zahl(liste.length)}`, anrufTabelle(liste)];
