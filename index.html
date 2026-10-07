@@ -199,16 +199,18 @@ const PFLICHTSPALTEN = ['notiz', 'datum'];
 /* ---------------------------------------------------------------------
    PERSONA: Jobtitel → Rollengruppe. Geprüft wird von oben nach unten,
    der erste Treffer gewinnt (Teilwort, Groß-/Kleinschreibung egal).
+   Dritter Eintrag (optional): Ausschlusswörter. Steht eines davon im Titel,
+   zählt die Rolle nicht, z. B. "Project Manager of COO" ist keine Geschäftsführung.
    --------------------------------------------------------------------- */
 const ROLLEN = [
-  ['Finanzleitung (CFO)',      ['cfo', 'chief financial', 'head of finance', 'finanzleit', 'leiter finanz', 'leitung finanz', 'kaufmännisch', 'kaufm. leit', 'finance director', 'director finance', 'vp finance', 'vice president finance', 'finanzvorstand', 'geschäftsführer finanzen', 'corporate finance', 'treasury']],
+  ['Finanzleitung (CFO)',      ['cfo', 'chief financial', 'head of finance', 'finanzleit', 'leiter finanz', 'leitung finanz', 'kaufmännisch', 'kaufm. leit', 'finance director', 'director finance', 'vp finance', 'vice president finance', 'finanzvorstand', 'geschäftsführer finanzen', 'corporate finance', 'treasury', 'md finance', 'managing director finance']],
   ['Controlling',              ['controll']],
   ['Buchhaltung / Kreditoren', ['buchhalt', 'accounting', 'rechnungswesen', 'kreditor', 'accounts payable', 'bilanz', 'finanzbuch', 'rechnungsprüf']],
   ['Einkauf / Procurement',    ['einkauf', 'einkäufer', 'procurement', 'purchas', 'beschaffung', 'sourcing', 'cpo', 'buyer', 'category manag']],
-  ['Geschäftsführung',         ['geschäftsführ', 'ceo', 'chief executive', 'managing director', 'managing partner', 'vorstand', 'inhaber', 'geschäftsleit', ' coo ', 'chairman']],
-  ['Logistik / Supply Chain',  ['logisti', 'supply chain', 'transport']],
+  ['Geschäftsführung',         ['geschäftsführ', 'ceo', 'chief executive', 'managing director', 'managing partner', 'vorstand', 'inhaber', 'geschäftsleit', ' coo ', 'chairman'], ['pmo', 'project manag', 'projektmanag', 'assistan', 'office']],
+  ['Logistik / Supply Chain',  ['logisti', 'supply chain', 'transport'], ['software']],
   ['Innovation',               ['innovation', 'ideenmanag', 'incubation', 'research', 'forschung', 'r&d']],
-  ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ', ' ai ', 'automation']],
+  ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ', ' ai ', 'automation', 'software']],
 ];
 const GROESSEN = [[0, '1–49'], [50, '50–249'], [250, '250–999'], [1000, '1.000–4.999'], [5000, '5.000+']];
 
@@ -553,7 +555,9 @@ function mitQuote(topf) {
 function rolleAus(jobtitel) {
   const t = ' ' + normalisiere(jobtitel).toLowerCase() + ' ';
   if (!t.trim()) return 'Unbekannt';
-  for (const [rolle, woerter] of ROLLEN) if (woerter.some(w => t.includes(w))) return rolle;
+  for (const [rolle, woerter, ausschluss = []] of ROLLEN) {
+    if (woerter.some(w => t.includes(w)) && !ausschluss.some(w => t.includes(w))) return rolle;
+  }
   return 'Sonstige';
 }
 // "1,001-5,000", "1001 - 5000", "250", "5.000+" → Größenklasse nach der ersten Zahl

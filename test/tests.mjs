@@ -234,6 +234,12 @@ testA('Persona: Rollen und Unternehmensgröße', async () => {
   assert.equal(r('Leiter Geschäftseinheit'), 'Sonstige');
   assert.equal(r('Product Owner'), 'Sonstige');
   assert.equal(r(''), 'Unbekannt');
+  // Fehler aus der Prüfung am 07.10.
+  assert.equal(r('MD Finance Körber Supply Chain Parcel Logistics Germany'), 'Finanzleitung (CFO)');
+  assert.equal(r('Head of PMO / Executive Project Manager of COO'), 'Sonstige');
+  assert.equal(r('COO / Geschäftsführer Operations & IT'), 'Geschäftsführung');
+  assert.equal(r('Head of Software Development Transport Technologie'), 'IT / Digitalisierung');
+  assert.equal(r('Head of CFO Office'), 'Finanzleitung (CFO)');
   assert.deepEqual(['1,001-5,000', '250', '5.000+', '10000', 'k. A.'].map(A.groesseAus), ['1.000–4.999', '250–999', '5.000+', '5.000+', 'Unbekannt']);
 });
 testA('Kontakte: Versuche bis zum ersten Gespräch', async () => {
