@@ -117,7 +117,8 @@ if (uploadDatei) {
   const { inhalt } = await A.entschluessle(JSON.parse(readFileSync(uploadDatei, 'utf8')), passwort);
   if (typeof inhalt.csv !== 'string') throw new Error('Upload enthält keine CSV.');
   text = inhalt.csv;
-  quelle = `Upload im Board: ${String(inhalt.quelle || 'Datei').slice(0, 120)}`;
+  const q = String(inhalt.quelle || 'Datei').slice(0, 160);
+  quelle = q.startsWith('Upload im Board') ? q : `Upload im Board: ${q}`;   // auch zum erneuten Einordnen des Online-Stands
 } else {
   const roh = readFileSync(datei);
   ({ text, quelle } = await A.anrufCsvAus(roh.buffer.slice(roh.byteOffset, roh.byteOffset + roh.byteLength), basename(datei)));
