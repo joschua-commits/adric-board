@@ -211,12 +211,16 @@ termin_gebucht: true NUR wenn in DIESEM Anruf ein Termin mit adric (Meeting, Cal
   false bei: "wollte keinen Termin", "schon vereinbart", "Termin konnte ich nicht ausmachen" –
   und bei RÜCKRUFEN: "morgen 15 Uhr nochmal anrufen", "will lieber 16.30 Uhr", "ruft zurück", "später nochmal probieren" sind KEINE Termine.
 stand: Stand nach dem Gespräch (bei allem außer gespraech: unklar)
-  interesse       der Gesprächspartner hat SELBST Interesse geäußert: will Demo/Angebot/mehr erfahren, bestätigt konkreten Bedarf, Termin gewünscht
+  interesse       NUR wenn der Gesprächspartner AUSDRÜCKLICH Interesse an adric bzw. der Lösung geäußert hat:
+                  "klingt interessant", will eine Demo oder einen Termin, "schicken Sie ein Angebot, wir prüfen das".
+                  Im Zweifel NICHT interesse.
   pending         es ist etwas offen, aber OHNE ausgesprochenes Interesse: an andere Person weitergeleitet/Empfehlung (Referral),
                   E-Mail oder Unterlagen geschickt bzw. zugesagt und Antwort steht aus, Rückruf vereinbart, "meldet sich", "nach dem Urlaub nochmal"
   kein_interesse  klare Absage, kein Bedarf, will nicht kontaktiert werden
   unklar          nicht erkennbar
-  Wichtig: "will erst Unterlagen" oder "leitet weiter" allein ist pending, nicht interesse.
+  Wichtig: Bitte um E-Mail/Unterlagen/Infos ("schicken Sie mir was"), Weiterleitung an eine andere Person,
+  Vertagung ("morgen besser", "nächste Woche") und Rückruf sind IMMER pending, nicht interesse.
+  Eigene Pläne ohne adric ("wollen das selbst automatisieren", "haben schon ein Tool") sind kein_interesse.
 einwand: Haupteinwand im Gespräch, genau einer (bei allem außer gespraech: keiner)
   keiner             kein Einwand oder Termin/Interesse ohne Vorbehalt
   schon_loesung      haben schon ein Tool/System/Dienstleister für Rechnungsprüfung

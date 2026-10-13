@@ -1839,7 +1839,9 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       ${a.beleg ? `<div class="beleg">„${esc(a.beleg)}“</div>` : ''}
       ${a.detail && KI_ERGEBNISSE[a.detail] && a.kategorie === 'niemand' ? `<div class="klein-text">${esc(labelErgebnis(a.detail))}</div>` : ''}
       ${kannKorrigieren() && a.engagementId ? `<br><select class="stufe-wahl" data-korrektur="${esc(a.engagementId)}" aria-label="Stufe korrigieren">
-        ${Object.entries(KI_STUFEN).map(([ki, k]) => `<option value="${ki}"${k === a.kategorie ? ' selected' : ''}>${esc(KATEGORIEN[k])}</option>`).join('')}</select>` : ''}</td>
+        ${Object.entries(KI_STUFEN).map(([ki, k]) => `<option value="${ki}"${k === a.kategorie ? ' selected' : ''}>${esc(KATEGORIEN[k])}</option>`).join('')}</select>
+        ${a.kategorie !== 'niemand' ? `<select class="stufe-wahl" data-korrektur-stand="${esc(a.engagementId)}" aria-label="Stand korrigieren">
+          ${Object.entries(KI_STAND).map(([k, l]) => `<option value="${k}"${k === (a.stand || 'unklar') ? ' selected' : ''}>Stand: ${esc(l)}</option>`).join('')}</select>` : ''}` : ''}</td>
     <td class="notiztext">${esc(a.notiz)}${a.schritt ? `<div class="klein-text">→ ${esc(a.schritt)}</div>` : ''}</td></tr>`;
   const anrufTabelle = liste => liste.length
     ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Stufe · Beleg</th><th>Notiz</th></tr></thead>
@@ -2035,7 +2037,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   }
 
   function zeigeKorrekturLeiste() {
-    const n = Object.keys(zustand.korrekturNeu?.stufe || {}).length;
+    const n = Object.values(zustand.korrekturNeu || {}).reduce((s, e) => s + Object.keys(e || {}).length, 0);
     let el = $('#korrekturLeiste');
     if (!n) { el?.remove(); return; }
     if (!el) { el = document.createElement('div'); el.id = 'korrekturLeiste'; el.className = 'korrektur-leiste no-print'; document.body.appendChild(el); }
@@ -2065,10 +2067,11 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     }
   }
   document.addEventListener('change', e => {
-    const sel = e.target.closest('[data-korrektur]');
+    const sel = e.target.closest('[data-korrektur], [data-korrektur-stand]');
     if (!sel) return;
-    zustand.korrekturNeu = zustand.korrekturNeu || { stufe: {} };
-    zustand.korrekturNeu.stufe[sel.dataset.korrektur] = sel.value;
+    zustand.korrekturNeu = zustand.korrekturNeu || {};
+    const art = sel.dataset.korrektur ? 'stufe' : 'stand';
+    (zustand.korrekturNeu[art] = zustand.korrekturNeu[art] || {})[sel.dataset.korrektur || sel.dataset.korrekturStand] = sel.value;
     rechne();
     zeigeKorrekturLeiste();
   });
