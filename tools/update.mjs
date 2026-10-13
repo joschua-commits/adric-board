@@ -31,7 +31,7 @@ const ENV_DATEI = process.env.ADRIC_ENV_DATEI || join(homedir(), 'adric job scra
 const KEYCHAIN = { dienst: 'adric-board-daten', konto: 'online' };
 const MODELLE = process.env.OPENAI_MODEL ? [process.env.OPENAI_MODEL] : ['gpt-5-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const STAPEL = 20;
-const PROMPT_VERSION = 5;          // erhöhen, wenn sich der Prompt ändert: dann wird neu eingeordnet
+const PROMPT_VERSION = 6;          // erhöhen, wenn sich der Prompt ändert: dann wird neu eingeordnet
 
 const html = readFileSync(join(WURZEL, 'index.html'), 'utf8');
 const A = new Function(html.match(/<script id="kern">([\s\S]*?)<\/script>/)[1] + '\nreturn ADRIC;')();
@@ -183,6 +183,18 @@ stufe – genau eine (die wichtigste Angabe):
   unklar             die Notiz gibt keine Einordnung her – dann NICHT raten
   Mischfälle: Sobald eine inhaltliche Information über den Prozess vorliegt, gilt echtes_gespraech –
   auch wenn die Person danach abgewimmelt hat. Bloße Vertagung ohne Inhalt ist abgewimmelt.
+  Die Information muss von einer Person im Unternehmen stammen, mit der tatsächlich gesprochen wurde,
+  und den Prozess oder die Zuständigkeit für Rechnungsprüfung betreffen. Deshalb sind KEIN echtes Gespräch:
+  - Auskünfte von Zentrale, Empfang oder Assistenz über Erreichbarkeit oder Kontaktweg
+    ("ist im Termin", "ist am Telefon", "Kontakt nur per E-Mail", "kann nicht weiterleiten") → kein_kontakt
+  - "arbeitet nicht mehr da", "falsche Nummer", "kennt die Person nicht", Nummer nicht vergeben → kein_kontakt
+  - Recherche-Notizen ohne Anruf (LinkedIn, Website) → kein_kontakt
+  - Absage mit Floskel oder pauschalem Grund ohne Angabe zum Prozess ("kein Interesse", "keine Kapazität",
+    "zu großes Unternehmen", "will keine Kaltakquise", "Nummer löschen", "nicht zuständig" und legt auf) → abgewimmelt
+  - Vertagung ohne konkrete Uhrzeit ("morgen vormittag besser", "ab 17. August", "in 2 Wochen", "später versuchen") → abgewimmelt
+  - "schon vereinbart", "abwarten auf Antwort" ohne Gesprächsinhalt → unklar
+  Echtes Gespräch über Zuständigkeit nur, wenn eine konkrete zuständige Person oder Durchwahl genannt
+  bzw. weitergeleitet wird oder erklärt wird, wo/wie die Rechnungsprüfung organisatorisch läuft.
 beleg: die Textstelle aus der Notiz, auf der die Stufe beruht – WÖRTLICH kopiert, höchstens 120 Zeichen.
   Bei unklar die Stelle, die am ehesten etwas aussagt, oder "".
 
@@ -319,7 +331,7 @@ const termineOhneAnruf = (existsSync(OHNE_ANRUF) ? JSON.parse(readFileSync(OHNE_
 A.wendeKiAn(anrufe, ki);
 A.wendeKorrekturenAn(anrufe, korrekturen);
 const r = A.auswerten(anrufe, null, null, termineOhneAnruf);
-console.log(`KI-Einordnung für ${anrufe.filter(a => a.ki).length}/${anrufe.length} Anrufe · ${r.uneinig.length} weichen von den Stichwortregeln ab · ${r.unsicher.length} unsicher`);
+console.log(`KI-Einordnung für ${anrufe.filter(a => a.ki).length}/${anrufe.length} Anrufe · ${r.unsicher.length} unsicher (→ UNKLAR)`);
 const g = r.gesamt;
 console.log(`Ergebnis: ${g.anrufe} Anrufe · ${g.gespraech} echte Gespräche · ${g.abgewimmelt} abgewimmelt · ${g.niemand} kein Kontakt · ${g.unklar} UNKLAR · ${g.termin + r.termineOhneAnruf.length} Termine`);
 
