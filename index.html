@@ -20,7 +20,7 @@
 // Stundenversatz, um den alle Uhrzeiten aus dem Export verschoben werden.
 // Die Zeiten im HubSpot-Export liegen nicht in deutscher Ortszeit.
 // Der Wert lässt sich auf der Seite ändern; das hier ist nur der Startwert.
-const STANDARD_STUNDENVERSATZ = 5;
+const STANDARD_STUNDENVERSATZ = 6;   // geprüft 13.10.2026: Export 09:03 = HubSpot-Oberfläche 15:03 (GMT+2)
 
 // Unter dieser Zahl von Anrufen wird jede Quote als "Stichprobe zu klein"
 // markiert. Eine Quote aus 3 Anrufen sagt nichts aus.
@@ -212,21 +212,73 @@ const ROLLEN = [
   ['Innovation',               ['innovation', 'ideenmanag', 'incubation', 'research', 'forschung', 'r&d']],
   ['IT / Digitalisierung',     ['cio', 'digital', 'informatik', 'head of it', ' it-', ' it ', ' erp', ' sap ', ' ai ', 'automation', 'software']],
 ];
+/* ---------------------------------------------------------------------
+   ZIELROLLEN (Jobtitel → A/B/C). Reihenfolge: A, dann C, dann B; erster Treffer gewinnt.
+   Dritter Eintrag: Ausschlusswörter. Ohne Treffer: "nicht zugeordnet" (wird nicht geraten).
+     A = besitzt die Rechnungsprüfung   B = kann weiterleiten   C = falsche Rolle
+   --------------------------------------------------------------------- */
+const ZIELROLLEN = [
+  ['A', ['logisti', 'transport', 'versand', 'shipping', 'distribution', 'fracht', 'freight', 'fuhrpark', 'fleet',
+         'kreditor', 'accounts payable', 'indirekt', 'indirect', 'dienstleistung', 'services procurement',
+         'category management services', 'shared service', 'fssc', 'rechnungsprüf', 'invoice'],
+        ['software', 'md finance', 'cfo', 'head of finance', 'sales', 'vertrieb']],
+  ['C', ['treasury', 'assistent', 'assistenz', 'assistant', 'direkteinkauf', 'direct procurement', 'direct material',
+         'materialeinkauf', 'materialwirtschaft', 'commodity', 'rohstoff', 'innovation', 'ideenmanag', 'vertrieb', 'sales',
+         'commercial', 'marketing', 'human resources', ' hr ', 'personalleit', 'recruit', 'application', 'applikation',
+         'r&d', 'research', 'forschung'],
+        ['kaufmännisch', 'cfo', 'chief financial']],
+  ['B', ['einkauf', 'einkäufer', 'procurement', 'purchas', 'beschaffung', 'sourcing', 'cpo', 'buyer',
+         'cfo', 'chief financial', 'finance', 'finanz', 'kaufmännisch', 'kaufm.', 'controll', 'buchhalt', 'accounting',
+         'rechnungswesen', 'supply chain', 'prozess', 'process', 'digital']],
+];
+const ZIELROLLEN_TEXT = {
+  A: 'A · besitzt die Rechnungsprüfung',
+  B: 'B · kann weiterleiten',
+  C: 'C · falsche Rolle',
+  nicht_zugeordnet: 'Nicht zugeordnet',
+  ohne_titel: 'Ohne Jobtitel',
+};
+
 const GROESSEN = [[0, '1–49'], [50, '50–249'], [250, '250–999'], [1000, '1.000–4.999'], [5000, '5.000+']];
 
 // Deutsche Mobilfunk-Vorwahlen ohne führende 0 (also 015x, 016x, 017x)
 const MOBIL_VORWAHLEN = ['15', '16', '17'];
 
+/* ---------------------------------------------------------------------
+   STUFEN: jeder Anruf genau eine. Intern heißen sie gespraech/abgewimmelt/niemand/unklar.
+     echtes Gespräch – mindestens eine inhaltliche Info über den Ist-Zustand (System, Prüfweg,
+                       Volumen, Zuständigkeit, Ansprechpartner, Durchwahl, Grund warum es nicht passt,
+                       konkreter Rückruftermin mit Uhrzeit). Gilt auch, wenn danach abgewimmelt wurde.
+     abgewimmelt     – Person dran, aber nur Nein oder Vertagung ohne Inhalt.
+     kein Kontakt    – niemand erreicht oder kein Austausch.
+     unklar          – Notiz gibt keine Einordnung her (wird nicht geraten, sondern separat gezeigt).
+   --------------------------------------------------------------------- */
 const KATEGORIEN = {
-  gespraech: 'Gespräch',
-  niemand:   'Niemand erreicht',
-  falsch:    'Falscher Kontakt / abwesend',
+  gespraech:   'Echtes Gespräch',
+  abgewimmelt: 'Abgewimmelt',
+  niemand:     'Kein Kontakt',
+  unklar:      'Unklar',
 };
+// KI-Stufe → interne Kategorie
+const KI_STUFEN = { echtes_gespraech: 'gespraech', abgewimmelt: 'abgewimmelt', kein_kontakt: 'niemand', unklar: 'unklar' };
+
+// Branchenwerte als Referenz (nur Anzeige)
+const BENCHMARK = {
+  gespraechsquote: 'Ø 5–6 %',
+  terminquote:     'Ø 4,6 %',
+  versucheProKontakt: { text: '6–8', rotUnter: 2 },
+  kontakteProFirma:   { text: '3–5', rotUnter: 2 },
+  nummerntyp: { handy: '15–22 % (Cognism, verifizierte Handynummern)', zentrale: '3–6 % (Cognism)' },
+};
+// Handy = +49 15x/16x/17x. Zentrale = 0800, endet auf 0 oder ist kurz (Rufnummer ohne +49 und
+// ohne führende 0 höchstens ZENTRALE_MAX_STELLEN Ziffern). Alles andere Deutsche = Durchwahl.
+const ZENTRALE_MAX_STELLEN = 8;
 const NUMMERNTYPEN = {
-  mobil:    'Mobil',
-  festnetz: 'Festnetz / Durchwahl',
-  ausland:  'Ausland',
-  keine:    'Keine Nummer',
+  handy:     'Handy',
+  durchwahl: 'Durchwahl',
+  zentrale:  'Zentrale',
+  ausland:   'Ausland',
+  keine:     'Keine Nummer',
 };
 const WOCHENTAGE = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
 
@@ -246,7 +298,11 @@ const KI_ERGEBNISSE = {
   falscher_kontakt:  { gruppe: 'falsch',    label: 'Falscher Kontakt' },
   abwesend:          { gruppe: 'falsch',    label: 'Abwesend' },
 };
-const KI_INTERESSE = { hoch: 'Hohes Interesse', mittel: 'Mittleres Interesse', keins: 'Kein Interesse', unklar: 'Unklar' };
+const KI_INTERESSE = { hoch: 'Hohes Interesse', mittel: 'Mittleres Interesse', keins: 'Kein Interesse', unklar: 'Unklar' };   // alt, bis Prompt v3
+// Stand nach dem Gespräch. Pending = es ist etwas offen, aber niemand hat Interesse ausgesprochen
+// (Weiterleitung/Empfehlung an einen neuen Kontakt, E-Mail oder Unterlagen raus, Rückruf vereinbart).
+const KI_STAND = { interesse: 'Interesse', pending: 'Pending', kein_interesse: 'Kein Interesse', unklar: 'Unklar' };
+const STAND_AUS_INTERESSE = { hoch: 'interesse', mittel: 'interesse', keins: 'kein_interesse', unklar: 'unklar' };
 // Haupteinwand im Gespräch (nur bei Gesprächen, von der KI eingeordnet)
 const KI_EINWAENDE = {
   keiner:            'Kein Einwand',
@@ -382,7 +438,7 @@ function klassifiziere(notiz) {
   const t = normalisiere(notiz).toLowerCase()
     .replace(_tippfehler, (_, davor, wort) => davor + TIPPFEHLER[wort]);
   for (const m of _niemand) if (m.trifft(t)) return { kategorie: 'niemand', treffer: m.wort, termin: false };
-  for (const m of _falsch) if (m.trifft(t)) return { kategorie: 'falsch', treffer: m.wort, termin: false };
+  for (const m of _falsch) if (m.trifft(t)) return { kategorie: 'abgewimmelt', treffer: m.wort, termin: false };
   const termin = _termin.some(m => m.trifft(t)) && !_keinTermin.some(m => m.trifft(t));
   return { kategorie: 'gespraech', treffer: null, termin };
 }
@@ -396,7 +452,9 @@ function nummernTyp(telefon) {
   if (!d.startsWith('49')) return 'ausland';
   let rest = d.slice(2);
   if (rest.startsWith('0')) rest = rest.slice(1);       // +49 0151 …
-  return MOBIL_VORWAHLEN.some(v => rest.startsWith(v)) ? 'mobil' : 'festnetz';
+  if (MOBIL_VORWAHLEN.some(v => rest.startsWith(v))) return 'handy';
+  if (rest.startsWith('800') || rest.endsWith('0') || rest.length <= ZENTRALE_MAX_STELLEN) return 'zentrale';
+  return 'durchwahl';
 }
 
 // "2026-10-01 05:33" (auch mit Sekunden oder als "01.10.2026 05:33").
@@ -536,7 +594,7 @@ function zeitraum(art, heute) {
    ===================================================================== */
 
 function leererTopf() {
-  return { anrufe: 0, gespraech: 0, niemand: 0, falsch: 0, termin: 0 };
+  return { anrufe: 0, gespraech: 0, abgewimmelt: 0, niemand: 0, unklar: 0, termin: 0 };
 }
 function zaehle(topf, a) {
   topf.anrufe++;
@@ -544,12 +602,21 @@ function zaehle(topf, a) {
   if (a.termin) topf.termin++;
 }
 function mitQuote(topf) {
-  topf.quote = topf.anrufe ? topf.gespraech / topf.anrufe : null;
+  topf.quote = topf.anrufe ? topf.gespraech / topf.anrufe : null;          // echte Gespräche je Anruf
   topf.kleineStichprobe = topf.anrufe < MINDEST_STICHPROBE;
   // Termine je Gespräch; die Basis sind hier die Gespräche, nicht die Anrufe
   topf.terminQuote = topf.gespraech ? topf.termin / topf.gespraech : null;
   topf.terminKleineStichprobe = topf.gespraech < MINDEST_STICHPROBE;
   return topf;
+}
+
+function zielrolleAus(jobtitel) {
+  const t = ' ' + normalisiere(jobtitel).toLowerCase().replace(/[|/,;()]+/g, ' ') + ' ';
+  if (!t.trim()) return 'ohne_titel';
+  for (const [klasse, woerter, ausschluss = []] of ZIELROLLEN) {
+    if (woerter.some(w => t.includes(w)) && !ausschluss.some(w => t.includes(w))) return klasse;
+  }
+  return 'nicht_zugeordnet';
 }
 
 function rolleAus(jobtitel) {
@@ -593,10 +660,11 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
   const nummern = Object.fromEntries(Object.keys(NUMMERNTYPEN).map(k => [k, leererTopf()]));
   const heat = WOCHENTAGE.map(() => Array.from({ length: 24 }, () => leererTopf()));
   const details = {};
-  const interesse = {};
+  const staende = {};
+  const pipe = new Map();
   const einwaende = {};
   const proKontakt = new Map();
-  const persona = { rolle: new Map(), branche: new Map(), groesse: new Map() };
+  const persona = { ziel: new Map(), rolle: new Map(), branche: new Map(), groesse: new Map() };
   const personaTopf = (map, k) => { if (!map.has(k)) map.set(k, Object.assign(leererTopf(), { name: k, kontakte: new Set() })); return map.get(k); };
 
   for (const a of anrufe) {
@@ -604,7 +672,17 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     zaehle(heat[a.wochentag][a.stunde], a);
     const det = a.detail || a.kategorie;
     details[det] = (details[det] || 0) + 1;
-    if (a.kategorie === 'gespraech' && a.interesse) interesse[a.interesse] = (interesse[a.interesse] || 0) + 1;
+    if (a.kategorie === 'gespraech' && a.stand) staende[a.stand] = (staende[a.stand] || 0) + 1;
+    {
+      // Pipeline je Kontakt: Termin schlägt alles, sonst gilt der Stand des letzten Anrufs mit Stand
+      const pk = kontaktSchluessel(a);
+      if (pk && (a.termin || a.stand)) {
+        const e = pipe.get(pk) || { name: `${a.vorname} ${a.nachname}`.trim() || '–', firma: a.firma, jobtitel: a.jobtitel, status: null, anruf: null };
+        if (a.termin) { e.status = 'termin'; e.anruf = a; }
+        else if (e.status !== 'termin') { e.status = a.stand; e.anruf = a; }
+        pipe.set(pk, e);
+      }
+    }
     if (a.einwand) einwaende[a.einwand] = (einwaende[a.einwand] || 0) + 1;
     const kk = kontaktSchluessel(a);
     if (kk) {
@@ -615,7 +693,7 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
       if (a.termin) k.termin = true;
       k.letzter = a;                                   // Anrufe sind chronologisch sortiert
     }
-    for (const [map, wert] of [[persona.rolle, rolleAus(a.jobtitel)], [persona.branche, a.branche || 'Unbekannt'], [persona.groesse, groesseAus(a.mitarbeiter)]]) {
+    for (const [map, wert] of [[persona.ziel, zielrolleAus(a.jobtitel)], [persona.rolle, rolleAus(a.jobtitel)], [persona.branche, a.branche || 'Unbekannt'], [persona.groesse, groesseAus(a.mitarbeiter)]]) {
       const t = personaTopf(map, wert);
       zaehle(t, a);
       if (kk) t.kontakte.add(kk);
@@ -657,7 +735,8 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     topFirmen,
     heat: heat.map(zeile => zeile.map(mitQuote)),
     details,                       // Ergebnis -> Anzahl (KI-Ergebnis oder Regel-Gruppe)
-    interesse,                     // nur Gespräche mit KI-Einschätzung
+    staende,                       // Stand je Gespräch: interesse | pending | kein_interesse | unklar
+    pipeline: ['termin', ...Object.keys(KI_STAND)].reduce((o, k) => (o[k] = [...pipe.values()].filter(e => e.status === k), o), {}),
     einwaende,                     // Haupteinwand je Gespräch (KI)
     kontaktListe: [...proKontakt.values()],
     hatPersona: anrufe.some(a => a.jobtitel || a.branche || a.mitarbeiter),
@@ -665,7 +744,7 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
       [...map.values()].map(t => mitQuote(Object.assign(t, { kontakte: t.kontakte.size, erreichtQuote: t.anrufe ? (t.anrufe - t.niemand) / t.anrufe : null })))
         .sort((x, y) => (x.name === 'Unbekannt') - (y.name === 'Unbekannt') || y.anrufe - x.anrufe)])),
     kiAnzahl: anrufe.filter(a => a.quelle === 'ki').length,
-    unsicher: anrufe.filter(a => a.ki && a.quelle !== 'ki'),
+    unsicher: anrufe.filter(a => a.ki && a.ki.sicherheit < KI_MINDEST_SICHERHEIT),
     uneinig: anrufe.filter(a => a.uneinig),
   };
 }
@@ -694,28 +773,34 @@ function wendeKiAn(anrufe, ki) {
     const k = ki && ki[kiSchluessel(a)];
     if (!k || k.h !== notizHash(a.notiz) || !KI_ERGEBNISSE[k.ergebnis]) { a.ki = null; continue; }
     a.ki = k;
-    const gruppe = KI_ERGEBNISSE[k.ergebnis].gruppe;
-    a.uneinig = gruppe !== a.regel.kategorie || (gruppe === 'gespraech' && !!k.termin !== a.regel.termin);
-    if (k.sicherheit < KI_MINDEST_SICHERHEIT) continue;      // unsicher: Regel bleibt
     a.quelle = 'ki';
-    a.kategorie = gruppe;
+    // Stufe aus der KI (ab Prompt v5); ältere Einordnungen über die Ergebnis-Gruppe
+    const alt = { gespraech: 'gespraech', falsch: 'abgewimmelt', niemand: 'niemand' }[KI_ERGEBNISSE[k.ergebnis].gruppe];
+    const gruppe = KI_STUFEN[k.stufe] || alt;
+    a.kategorie = k.sicherheit < KI_MINDEST_SICHERHEIT ? 'unklar' : gruppe;   // unsicher: nicht raten
+    a.beleg = k.beleg || '';
     a.detail = k.ergebnis;
-    a.termin = gruppe === 'gespraech' && !!k.termin;
-    a.interesse = gruppe === 'gespraech' ? k.interesse : null;
+    a.termin = !!k.termin && a.kategorie !== 'niemand';
+    a.stand = a.kategorie === 'gespraech' || a.kategorie === 'abgewimmelt'
+      ? (KI_STAND[k.stand] ? k.stand : STAND_AUS_INTERESSE[k.interesse] || 'unklar') : null;
     a.schritt = k.schritt || '';
-    a.einwand = gruppe === 'gespraech' && KI_EINWAENDE[k.einwand] ? k.einwand : null;
+    a.einwand = a.kategorie !== 'niemand' && KI_EINWAENDE[k.einwand] ? k.einwand : null;
   }
   return anrufe;
 }
 
 // Korrekturen von Hand, z. B. wenn ein Termin erst nach dem Anruf per E-Mail zustande kam.
-// korrekturen: { termin: { [Engagement ID]: true | false }, firma: { [Engagement ID]: 'Name' } }
+// korrekturen: { termin: { [ID]: bool }, firma: { [ID]: 'Name' }, stand: { [ID]: 'pending' | … }, stufe: { [ID]: 'echtes_gespraech' | 'abgewimmelt' | 'kein_kontakt' | 'unklar' } }
 // Termin gilt nach KI und Regeln; Firma füllt nur leere Firmennamen.
 function wendeKorrekturenAn(anrufe, korrekturen) {
   const termin = (korrekturen && korrekturen.termin) || {};
   const firma = (korrekturen && korrekturen.firma) || {};
+  const stand = (korrekturen && korrekturen.stand) || {};
+  const stufe = (korrekturen && korrekturen.stufe) || {};
   for (const a of anrufe) {
     if (firma[a.engagementId] && !a.firma) a.firma = String(firma[a.engagementId]);
+    if (KI_STUFEN[stufe[a.engagementId]]) { a.kategorie = KI_STUFEN[stufe[a.engagementId]]; a.stufeManuell = true; }
+    if (stand[a.engagementId] && KI_STAND[stand[a.engagementId]]) { a.stand = stand[a.engagementId]; a.manuell = true; }
     if (!(a.engagementId in termin)) continue;
     a.termin = !!termin[a.engagementId];
     if (a.termin) a.kategorie = 'gespraech';
@@ -839,7 +924,7 @@ const ADRIC = {
   STANDARD_STUNDENVERSATZ, MINDEST_STICHPROBE, KATEGORIEN, NUMMERNTYPEN, WOCHENTAGE,
   parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
   leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
-  KI_ERGEBNISSE, KI_INTERESSE, KI_EINWAENDE, ROLLEN, rolleAus, groesseAus, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
+  KI_ERGEBNISSE, KI_INTERESSE, KI_STAND, KI_STUFEN, KI_EINWAENDE, ROLLEN, rolleAus, ZIELROLLEN, zielrolleAus, BENCHMARK, groesseAus, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
   entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, verschluessleMitSchluessel, entschluessle, b64, unb64, alsAnrufCsv,
 };
 </script>
@@ -968,15 +1053,15 @@ input[type="number"] { width: 64px; }
 .hinweis-leer { text-align: center; padding: 40px 16px; color: var(--ink-2); }
 
 /* Hero */
-.hero { display: grid; grid-template-columns: 1.35fr repeat(2, 1fr); grid-template-rows: auto auto; gap: 14px; margin-bottom: 14px; }
-.hero .gross { grid-row: span 2; position: relative; overflow: hidden;
+.hero { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 14px; }
+.hero .gross { position: relative; overflow: hidden;
   background: linear-gradient(150deg, color-mix(in oklab, var(--accent) 26%, var(--card-solid)), var(--card-solid) 70%); border-color: color-mix(in oklab, var(--accent) 40%, transparent); }
 .hero .gross::after { content: ""; position: absolute; right: -80px; bottom: -80px; width: 260px; height: 260px; border-radius: 50%;
   background: radial-gradient(circle, var(--glow-1), transparent 70%); pointer-events: none; }
 .kpi .titel { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-2); font-weight: 600; }
 .kpi .wert { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 800; font-size: clamp(34px, 4.4vw, 52px);
   line-height: 1; margin: 10px 0 8px; letter-spacing: -0.04em; }
-.hero .gross .wert { font-size: clamp(72px, 11vw, 140px); background: linear-gradient(180deg, var(--ink), color-mix(in oklab, var(--ink) 55%, var(--accent)));
+.hero .gross .wert { font-size: clamp(40px, 5.5vw, 64px); background: linear-gradient(180deg, var(--ink), color-mix(in oklab, var(--ink) 55%, var(--accent)));
   -webkit-background-clip: text; background-clip: text; color: transparent; }
 .kpi .zusatz { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .delta { font-family: var(--mono); font-size: 12.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
@@ -1010,7 +1095,7 @@ input[type="number"] { width: 64px; }
 .legende { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 10px; }
 .legende span { display: inline-flex; align-items: center; gap: 6px; }
 .farbe { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
-.f-gespraech { background: var(--good); } .f-falsch { background: var(--warn); } .f-niemand { background: var(--bad); }
+.f-gespraech { background: var(--good); } .f-abgewimmelt, .f-falsch { background: var(--warn); } .f-niemand { background: var(--bad); } .f-unklar { background: var(--muted); }
 .balken-gross { display: flex; gap: 3px; height: 16px; margin: 4px 0 14px; }
 .balken-gross i { border-radius: 5px; }
 .reihen { font-size: 14px; }
@@ -1108,8 +1193,20 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 .mini-kpis .t { font-size: 12px; color: var(--muted); }
 .persona-raster { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .persona-raster > :first-child { grid-column: 1 / -1; }
+.pipe-raster > :first-child { grid-column: auto; }
+.pipe-eintrag { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.pipe-eintrag:last-child { border-bottom: 0; }
+.pipe-kpis > div { cursor: pointer; }
 .hinweis-box { padding: 14px 16px; border-radius: 12px; border: 1px dashed var(--line-2); color: var(--ink-2); font-size: 14px; line-height: 1.6; }
 @media (max-width: 760px) { .mini-kpis { grid-template-columns: 1fr 1fr; } .persona-raster { grid-template-columns: 1fr; } }
+
+/* Benchmarks, Ampel, Stufen-Korrektur */
+.bench { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.kpi.rot .wert, .mini-kpis .rot .w { color: var(--bad-ink); }
+.beleg { font-size: 12.5px; color: var(--ink-2); font-style: italic; margin-top: 4px; }
+.stufe-wahl { font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--card-solid); color: var(--ink); margin-top: 4px; }
+.korrektur-leiste { position: sticky; bottom: 12px; z-index: 6; display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  padding: 12px 16px; margin-top: 14px; border-radius: 14px; border: 1px solid var(--accent); background: color-mix(in oklab, var(--card-solid) 90%, transparent); backdrop-filter: blur(10px); }
 
 /* Upload-Status */
 .upload-status { display: flex; gap: 12px; align-items: center; padding: 12px 16px; margin-bottom: 14px; border-radius: 14px;
@@ -1141,7 +1238,6 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 /* Tablet und Handy */
 @media (max-width: 1000px) {
   .hero { grid-template-columns: 1fr 1fr; }
-  .hero .gross { grid-column: 1 / -1; grid-row: auto; }
 }
 @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 @media (max-width: 640px) {
@@ -1247,6 +1343,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <section class="card auftritt"><h2>Trichter <span class="h2-zusatz">vom Wählen bis zum Termin</span></h2><div id="trichter"></div></section>
         <section class="card auftritt"><h2>Ergebnis der Anrufe <span class="h2-zusatz" id="ergebnisZusatz"></span></h2><div id="ergebnis"></div></section>
         <section class="card voll auftritt"><h2>Wann erreicht man wen? <span class="h2-zusatz" id="heatZusatz"></span></h2><div id="heat"></div></section>
+        <section class="card voll auftritt"><h2>Pipeline <span class="h2-zusatz">Stand je Kontakt nach dem letzten Gespräch</span></h2><div id="pipeline"></div></section>
         <section class="card voll auftritt"><h2>Gebuchte Termine <span class="h2-zusatz" id="termineZusatz"></span></h2><div id="termine"></div></section>
         <section class="card auftritt"><h2>Pro Tag</h2><div id="proTag"></div></section>
         <section class="card auftritt"><h2>Nach Nummerntyp</h2><div id="proNummer"></div></section>
@@ -1256,7 +1353,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <section class="card auftritt"><h2>Einwände im Gespräch <span class="h2-zusatz" id="einwandZusatz"></span></h2><div id="einwaende"></div></section>
         <section class="card voll auftritt"><h2>Persona <span class="h2-zusatz">Wer ist erreichbar, wer spricht, wer bucht?</span></h2><div id="persona"></div></section>
         <section class="card voll auftritt" id="uneinigKarte"></section>
-        <section class="card voll auftritt"><h2>Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
+        <section class="card voll auftritt"><h2>Echte Gespräche <span class="h2-zusatz" id="gespraecheZusatz"></span></h2><div id="gespraeche"></div></section>
         <section class="card voll auftritt"><h2>Top-Firmen nach Anrufen</h2><div id="firmen"></div></section>
       </div>
     </div>
@@ -1289,9 +1386,9 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     weg(k) { try { localStorage.removeItem(k); } catch { /* egal */ } },
   };
 
-  const gespeicherterVersatz = parseFloat(speicher.get('adric.versatz'));
+  const gespeicherterVersatz = parseFloat(speicher.get('adric.versatz.v2'));
   const zustand = {
-    text: null, dateiname: '', ki: null, online: null, termineOhneAnruf: [], korrekturen: null,
+    text: null, dateiname: '', ki: null, online: null, termineOhneAnruf: [], korrekturen: null, korrekturNeu: null,
     versatz: Number.isFinite(gespeicherterVersatz) ? gespeicherterVersatz : STANDARD_STUNDENVERSATZ,
     art: 'woche', von: null, bis: null, daten: null,
   };
@@ -1325,15 +1422,17 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   const STICHPROBE_TITEL = `Weniger als ${MINDEST_STICHPROBE} – die Quote ist nicht belastbar`;
   const kleinHinweis = n => `<span class="klein" title="${esc(STICHPROBE_TITEL)}">⚠ Stichprobe zu klein (${n})</span>`;
   const legende = () => `<div class="legende">
-      <span><i class="farbe f-gespraech"></i>Gespräch</span>
-      <span><i class="farbe f-falsch"></i>Falscher Kontakt / abwesend</span>
-      <span><i class="farbe f-niemand"></i>Niemand erreicht</span></div>`;
+      <span><i class="farbe f-gespraech"></i>Echtes Gespräch</span>
+      <span><i class="farbe f-abgewimmelt"></i>Abgewimmelt</span>
+      <span><i class="farbe f-niemand"></i>Kein Kontakt</span>
+      <span><i class="farbe f-unklar"></i>Unklar</span></div>`;
 
   function aufteilungText(t) {
-    return `Gespräch           ${String(t.gespraech).padStart(4)}\n` +
+    return `Echtes Gespräch    ${String(t.gespraech).padStart(4)}\n` +
            `  davon Termin     ${String(t.termin).padStart(4)}\n` +
-           `Falsch / abwesend  ${String(t.falsch).padStart(4)}\n` +
-           `Niemand erreicht   ${String(t.niemand).padStart(4)}\n` +
+           `Abgewimmelt        ${String(t.abgewimmelt).padStart(4)}\n` +
+           `Kein Kontakt       ${String(t.niemand).padStart(4)}\n` +
+           (t.unklar ? `Unklar             ${String(t.unklar).padStart(4)}\n` : '') +
            `Anrufe gesamt      ${String(t.anrufe).padStart(4)}` +
            (t.quote != null ? `\nGesprächsquote     ${prozent(t.quote).padStart(5)}` : '') +
            (t.kleineStichprobe && t.anrufe ? `\n⚠ Stichprobe zu klein` : '');
@@ -1341,12 +1440,12 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   function balken(t, max, klasse = 'balken') {
     if (!t.anrufe) return `<div class="${klasse}"></div>`;
-    const teile = [['gespraech', t.gespraech], ['falsch', t.falsch], ['niemand', t.niemand]]
+    const teile = [['gespraech', t.gespraech], ['abgewimmelt', t.abgewimmelt], ['niemand', t.niemand], ['unklar', t.unklar]]
       .filter(([, n]) => n > 0)
       .map(([k, n]) => `<i class="f-${k}" style="flex:${n}"></i>`).join('');
     const breite = max ? (t.anrufe / max) * 100 : 0;
     return `<div class="${klasse}" style="width:${breite.toFixed(2)}%" role="img"
-      aria-label="${t.anrufe} Anrufe, davon ${t.gespraech} Gespräche, ${t.falsch} falscher Kontakt, ${t.niemand} niemand erreicht">${teile}</div>`;
+      aria-label="${t.anrufe} Anrufe, davon ${t.gespraech} echte Gespräche, ${t.abgewimmelt} abgewimmelt, ${t.niemand} kein Kontakt, ${t.unklar} unklar">${teile}</div>`;
   }
 
   function reihen(eintraege) {
@@ -1394,7 +1493,8 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
     const kl = r.kontaktListe, mitG = kl.filter(k => k.gespraeche).length;
     let t = `<strong>${zahl(g.anrufe)}</strong> Anrufe an <strong>${zahl(r.telefontage)}</strong> Telefontag${r.telefontage === 1 ? '' : 'en'} (Ø ${proTag}), ` +
-      `<strong>${zahl(g.gespraech)}</strong> Gespräche (${prozent(g.quote)}${g.kleineStichprobe ? ', Stichprobe klein' : ''}) und <strong>${zahl(termineGesamt)}</strong> Termin${termineGesamt === 1 ? '' : 'e'}. ` +
+      `<strong>${zahl(g.gespraech)}</strong> echte Gespräche (${prozent(g.quote)}${g.kleineStichprobe ? ', Stichprobe klein' : ''}), ${zahl(g.abgewimmelt)} abgewimmelt, ${zahl(g.niemand)} ohne Kontakt` +
+      (g.unklar ? `, ${zahl(g.unklar)} unklar` : '') + ` und <strong>${zahl(termineGesamt)}</strong> Termin${termineGesamt === 1 ? '' : 'e'}. ` +
       `${zahl(kl.length)} Kontakte bei ${zahl(r.firmen)} Firmen angerufen, ${zahl(mitG)} davon gesprochen.`;
     if (v && v.gesamt.anrufe) {
       const d = (a, b) => (a - b > 0 ? '+' : a - b < 0 ? '−' : '±') + Math.abs(a - b);
@@ -1419,10 +1519,11 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     };
     vergleich(a.proStunde.map(t => ({ label: `${String(t.stunde).padStart(2, '0')}–${String(t.stunde + 1).padStart(2, '0')} Uhr`, t })), ' Uhrzeit');
     vergleich(a.proWochentag.map(t => ({ label: t.label, t })), 'r Wochentag');
-    const mob = a.proNummerTyp.find(t => t.typ === 'mobil'), fest = a.proNummerTyp.find(t => t.typ === 'festnetz');
-    if (mob.anrufe >= n && fest.anrufe >= n && Math.abs(mob.quote - fest.quote) >= 0.05) {
-      const besser = mob.quote > fest.quote ? 'Mobilnummern' : 'Festnetz/Durchwahlen';
-      liste.push(['📱', `<strong>${besser}</strong> bringen mehr Gespräche: Mobil ${prozent(mob.quote)}, Festnetz ${prozent(fest.quote)}.`, `n = ${mob.anrufe} / ${fest.anrufe}`]);
+    const nt = Object.fromEntries(a.proNummerTyp.map(t => [t.typ, t]));
+    const ntOk = ['handy', 'durchwahl', 'zentrale'].filter(k => nt[k].anrufe >= n);
+    if (ntOk.length >= 2) {
+      liste.push(['📱', `Echte Gespräche nach Nummerntyp: ${ntOk.map(k => `${NUMMERNTYPEN[k]} <strong>${prozent(nt[k].quote)}</strong>`).join(', ')}. Referenz: Handy ${BENCHMARK.nummerntyp.handy}, Zentrale ${BENCHMARK.nummerntyp.zentrale}.`,
+        `n = ${ntOk.map(k => nt[k].anrufe).join(' / ')}`]);
     }
     const blockiert = (a.details.zentrale_blockt || 0) + (a.details.nummer_ungueltig || 0);
     if (g.anrufe >= n && blockiert / g.anrufe >= 0.12) {
@@ -1485,22 +1586,32 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
     // Hero
     const proTag = r.telefontage ? (g.anrufe / r.telefontage).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    const anteil = n => g.anrufe ? prozent(n / g.anrufe) : '–';
+    const proTermin = termineGesamt ? (g.anrufe / termineGesamt).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    const terminQuoteGesamt = g.gespraech ? termineGesamt / g.gespraech : null;
     $('#hero').innerHTML = `
-      <div class="card kpi gross auftritt" data-liste="termine" tabindex="0" role="button"><div class="titel">Termine gebucht</div>
-        <div class="wert" data-ziel="${termineGesamt}">0</div>
-        <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${zahl(g.termin)} aus Anrufen · ${prozent(g.terminQuote)} der Gespräche</span>
-          ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}
-          ${r.termineOhneAnruf.length ? `<span>+ ${zahl(r.termineOhneAnruf.length)} ohne Anruf</span>` : ''}
-          ${deltaHtml(termineGesamt, v ? v.gesamt.termin + v.termineOhneAnruf.length : null, vName)}</div></div>
-      <div class="card kpi auftritt" data-liste="anrufe" tabindex="0" role="button"><div class="titel">Anrufe</div><div class="wert" data-ziel="${g.anrufe}">0</div>
+      <div class="card kpi auftritt" data-liste="anrufe" tabindex="0" role="button"><div class="titel">Anrufe gesamt</div>
+        <div class="wert" data-ziel="${g.anrufe}">0</div>
         <div class="zusatz"><span>${zahl(r.telefontage)} Telefontag${r.telefontage === 1 ? '' : 'e'} · Ø ${proTag}</span>${deltaHtml(g.anrufe, v?.gesamt.anrufe, vName)}</div></div>
-      <div class="card kpi auftritt" data-liste="gespraeche" tabindex="0" role="button"><div class="titel">Gespräche</div><div class="wert" data-ziel="${g.gespraech}">0</div>
-        <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">Quote ${prozent(g.quote)}</span>
-          ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}${deltaHtml(g.gespraech, v?.gesamt.gespraech, vName)}</div></div>
-      <div class="card kpi auftritt" data-liste="kontakte" tabindex="0" role="button"><div class="titel">Kontakte</div><div class="wert" data-ziel="${r.kontakte}">0</div>
-        <div class="zusatz">verschiedene Personen</div></div>
-      <div class="card kpi auftritt" data-liste="firmen" tabindex="0" role="button"><div class="titel">Firmen</div><div class="wert" data-ziel="${r.firmen}">0</div>
-        <div class="zusatz">verschiedene Unternehmen</div></div>`;
+      <div class="card kpi gross auftritt" data-liste="gespraeche" tabindex="0" role="button"><div class="titel">Echte Gespräche</div>
+        <div class="wert" data-ziel="${g.gespraech}">0</div>
+        <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">${anteil(g.gespraech)} der Anrufe</span>
+          ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}${deltaHtml(g.gespraech, v?.gesamt.gespraech, vName)}</div>
+        <div class="bench">Branche: Gesprächsquote ${BENCHMARK.gespraechsquote}</div></div>
+      <div class="card kpi gross auftritt" data-liste="termine" tabindex="0" role="button"><div class="titel">Termine</div>
+        <div class="wert" data-ziel="${termineGesamt}">0</div>
+        <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(terminQuoteGesamt)} der echten Gespräche</span>
+          ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}
+          ${r.termineOhneAnruf.length ? `<span>inkl. ${zahl(r.termineOhneAnruf.length)} ohne Anruf</span>` : ''}
+          ${deltaHtml(termineGesamt, v ? v.gesamt.termin + v.termineOhneAnruf.length : null, vName)}</div>
+        <div class="bench">Branche: Terminquote ${BENCHMARK.terminquote}</div></div>
+      <div class="card kpi auftritt" data-liste="stufe:abgewimmelt" tabindex="0" role="button"><div class="titel">Abgewimmelt</div>
+        <div class="wert" data-ziel="${g.abgewimmelt}">0</div><div class="zusatz">${anteil(g.abgewimmelt)} der Anrufe</div></div>
+      <div class="card kpi auftritt" data-liste="stufe:niemand" tabindex="0" role="button"><div class="titel">Kein Kontakt</div>
+        <div class="wert" data-ziel="${g.niemand}">0</div><div class="zusatz">${anteil(g.niemand)} der Anrufe</div></div>
+      <div class="card kpi auftritt"><div class="titel">Anrufe pro Termin</div>
+        <div class="wert">${proTermin}</div>
+        <div class="zusatz" data-liste="stufe:unklar" style="cursor:pointer">${g.unklar ? `⚠ <strong>${zahl(g.unklar)} UNKLAR</strong> (${anteil(g.unklar)}) – nicht eingeordnet, ansehen` : 'Keine UNKLAR-Fälle'}</div></div>`;
     zaehleHoch($('#hero'));
 
     // Leerer Zeitraum
@@ -1517,13 +1628,13 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     }
 
     // Trichter
-    const erreicht = g.anrufe - g.niemand;
+    const erreicht = g.gespraech + g.abgewimmelt;
     const mitKi = r.kiAnzahl > 0;
-    const interessiert = (r.interesse.hoch || 0) + (r.interesse.mittel || 0);
+    const interessiert = r.gespraeche.filter(a => a.stand === 'interesse' || a.termin).length;
     const stufen = [
       ['Anrufe', g.anrufe, null, 'anrufe'],
-      ['Jemand erreicht', erreicht, g.anrufe, 'erreicht'],
-      ['Gespräch', g.gespraech, erreicht, 'gespraeche'],
+      ['Kontakt hergestellt', erreicht, g.anrufe, 'erreicht'],
+      ['Echtes Gespräch', g.gespraech, erreicht, 'gespraeche'],
       ...(mitKi ? [['Interesse', interessiert, g.gespraech, 'interesse']] : []),
       ['Termin', g.termin, mitKi ? interessiert : g.gespraech, 'termine'],
     ];
@@ -1537,18 +1648,22 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       </div>`;
     }).join('') + (mitKi ? '' : '<p class="notiz-klein">„Interesse“ erscheint, sobald KI-Einordnungen vorliegen.</p>');
 
-    // Ergebnis-Verteilung (KI-Detail oder Regel-Gruppe)
-    const det = Object.entries(r.details).sort((a, b) => b[1] - a[1]);
-    const maxDet = det[0]?.[1] || 1;
+    // Ergebnis: Stufen und Gründe ohne Kontakt
+    const stufenListe = ['gespraech', 'abgewimmelt', 'niemand', 'unklar'].map(k => [k, g[k]]);
+    const gruende = Object.entries(r.anrufe.filter(a => a.kategorie === 'niemand').reduce((o, a) => (o[a.detail] = (o[a.detail] || 0) + 1, o), {}))
+      .filter(([k]) => KI_ERGEBNISSE[k]).sort((a, b) => b[1] - a[1]);
     $('#ergebnisZusatz').textContent = mitKi ? `${zahl(r.kiAnzahl)} von ${zahl(g.anrufe)} per KI eingeordnet` : 'nach Stichwortregeln';
     $('#ergebnis').innerHTML = legende() + `<div data-tip="${esc(aufteilungText(g))}">${balken(g, g.anrufe, 'balken-gross')}</div>` +
-      det.map(([k, n]) => `<div class="vert" data-liste="detail:${esc(k)}" title="Liste anzeigen">
-        <span>${esc(labelErgebnis(k))}</span>
-        <div class="spur"><i class="f-${gruppeErgebnis(k)}" style="width:${(n / maxDet * 100).toFixed(1)}%"></i></div>
-        <span class="n num">${zahl(n)}</span><span class="p num">${prozent(n / g.anrufe)}</span></div>`).join('') +
+      stufenListe.map(([k, n]) => `<div class="vert" data-liste="stufe:${k}" title="Liste anzeigen">
+        <span>${esc(KATEGORIEN[k])}</span>
+        <div class="spur"><i class="f-${k}" style="width:${g.anrufe ? (n / g.anrufe * 100).toFixed(1) : 0}%"></i></div>
+        <span class="n num">${zahl(n)}</span><span class="p num">${prozent(g.anrufe ? n / g.anrufe : null)}</span></div>`).join('') +
+      (gruende.length ? `<div class="zwischentitel">Gründe bei „Kein Kontakt“</div>` + gruende.map(([k, n]) => `<div class="vert" data-liste="detail:${esc(k)}">
+        <span>${esc(labelErgebnis(k))}</span><div class="spur"><i class="f-niemand" style="width:${(n / gruende[0][1] * 100).toFixed(1)}%"></i></div>
+        <span class="n num">${zahl(n)}</span><span class="p num">${prozent(n / g.anrufe)}</span></div>`).join('') : '') +
       `<p class="notiz-klein">${mitKi
-        ? `Eingeordnet per OpenAI. Bei einer Sicherheit unter ${Math.round(KI_MINDEST_SICHERHEIT * 100)} % gilt die Stichwortregel (${zahl(r.unsicher.length)} Fälle).`
-        : '„Gespräch“ ist hier eine Obergrenze: Gezählt wird jede Notiz ohne Stichwort für „niemand erreicht“ oder „falscher Kontakt“.'}</p>`;
+        ? `Stufe je Anruf per OpenAI mit Textstelle als Beleg. Unter ${Math.round(KI_MINDEST_SICHERHEIT * 100)} % Sicherheit oder ohne Anhaltspunkt: UNKLAR statt raten. Jede Stufe ist in den Listen von Hand korrigierbar.`
+        : 'Ohne KI-Einordnung: „Gespräch“ ist hier eine Obergrenze nach Stichwortregeln und nicht mit den KI-Zahlen vergleichbar.'}</p>`;
 
     // Heatmap Wochentag × Stunde
     const tageMit = WOCHENTAGE.map((_, i) => i).filter(i => i < 5 || r.heat[i].some(t => t.anrufe));
@@ -1596,7 +1711,22 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       .map(t => ({ label: `${String(t.stunde).padStart(2, '0')}–${String((t.stunde + 1) % 24).padStart(2, '0')} Uhr`, t })));
     $('#stundeZusatz').textContent = `Versatz ${versatzText(zustand.versatz)}`;
     $('#proNummer').innerHTML = reihen(r.proNummerTyp.filter(t => t.anrufe).map(t => ({ label: t.label, t })))
-      + `<p class="notiz-klein">Mobil = deutsche Nummer mit 015, 016 oder 017. Festnetz = andere deutsche Nummer.</p>`;
+      + `<p class="notiz-klein">„Quote“ = echte Gespräche je Anruf. Referenz: Handy ${BENCHMARK.nummerntyp.handy}, Zentrale ${BENCHMARK.nummerntyp.zentrale}.<br>
+        Handy = +49 15x/16x/17x. Zentrale = 0800, endet auf 0 oder höchstens ${ZENTRALE_MAX_STELLEN} Ziffern ohne Vorwahl-0. Sonst Durchwahl. Nummern stehen in jeder Anrufliste zum Prüfen.</p>`;
+
+    // Pipeline
+    const PIPE = [['termin', 'Termin', 'hoch'], ['interesse', 'Interesse', 'hoch'], ['pending', 'Pending', 'mittel'], ['kein_interesse', 'Kein Interesse', ''], ['unklar', 'Unklar', '']];
+    const pipeKarte = e => `<div class="pipe-eintrag" data-tip="${esc(e.anruf.notiz.slice(0, 400))}">
+        <strong>${esc(e.name)}</strong> <span class="klein-text">${esc(e.firma || '–')}${e.jobtitel ? ' · ' + esc(e.jobtitel.slice(0, 50)) : ''}</span>
+        <div class="klein-text">${tagKurz(e.anruf.tag)} · ${esc(e.anruf.schritt || e.anruf.notiz.replace(/\s+/g, ' ').slice(0, 90))}${e.anruf.manuell ? ' · von Hand' : ''}</div></div>`;
+    $('#pipeline').innerHTML = `<div class="mini-kpis pipe-kpis">${PIPE.slice(0, 4).map(([k, l]) =>
+        `<div data-liste="pipeline:${k}"><div class="w">${zahl(r.pipeline[k].length)}</div><div class="t">${l}</div></div>`).join('')}</div>
+      <div class="persona-raster pipe-raster">
+        <div><div class="zwischentitel">Interesse · ${zahl(r.pipeline.interesse.length)}</div>${r.pipeline.interesse.map(pipeKarte).join('') || '<p class="notiz-klein">Niemand.</p>'}</div>
+        <div><div class="zwischentitel">Pending · ${zahl(r.pipeline.pending.length)}</div>${r.pipeline.pending.map(pipeKarte).join('') || '<p class="notiz-klein">Niemand.</p>'}</div>
+      </div>
+      <p class="notiz-klein"><strong>Interesse</strong> = hat selbst Interesse geäußert. <strong>Pending</strong> = offen, aber ohne ausgesprochenes Interesse:
+        Weiterleitung an neuen Kontakt, E-Mail oder Unterlagen raus, Rückruf vereinbart. Falsch eingeordnet? In <code>.lokal/korrekturen.json</code> unter „stand“ korrigieren.</p>`;
 
     // Wochen-Summary (gewählter Zeitraum) und Erkenntnisse (alle Daten, robuster)
     const alle = (zustand.von || zustand.bis) ? auswerten(d.anrufe, null, null, zustand.termineOhneAnruf) : r;
@@ -1613,12 +1743,16 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       ['3. Versuch', versucheBis.filter(n => n === 3).length], ['4.+ Versuch', versucheBis.filter(n => n >= 4).length]];
     const maxBis = Math.max(1, ...stufenBis.map(x => x[1]));
     const schnitt = arr => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length).toLocaleString('de-DE', { maximumFractionDigits: 1 }) : '–';
+    const vpk = r.kontakte ? g.anrufe / r.kontakte : null;                 // Anrufe / verschiedene Personen
+    const kpf = r.firmen ? r.kontakte / r.firmen : null;                  // verschiedene Personen / verschiedene Firmen
     $('#kontakte').innerHTML = `<div class="mini-kpis">
-        <div data-liste="kontakte"><div class="w">${zahl(kl.length)}</div><div class="t">Kontakte angerufen</div></div>
-        <div data-liste="kontakte-gespraech"><div class="w">${zahl(mitG.length)}</div><div class="t">mit Gespräch (${prozent(kl.length ? mitG.length / kl.length : null)})</div></div>
-        <div><div class="w">${schnitt(kl.map(k => k.versuche))}</div><div class="t">Ø Versuche je Kontakt</div></div>
-        <div><div class="w">${schnitt(versucheBis)}</div><div class="t">Ø Versuche bis Gespräch</div></div></div>
-      <div class="zwischentitel">Gespräch kam zustande beim …</div>
+        <div class="${vpk != null && vpk < BENCHMARK.versucheProKontakt.rotUnter ? 'rot' : ''}"><div class="w">${vpk == null ? '–' : vpk.toLocaleString('de-DE', { maximumFractionDigits: 2 })}</div>
+          <div class="t">Versuche pro Kontakt</div><div class="bench">Benchmark ${BENCHMARK.versucheProKontakt.text}</div></div>
+        <div class="${kpf != null && kpf < BENCHMARK.kontakteProFirma.rotUnter ? 'rot' : ''}"><div class="w">${kpf == null ? '–' : kpf.toLocaleString('de-DE', { maximumFractionDigits: 2 })}</div>
+          <div class="t">Kontakte pro Firma</div><div class="bench">Ziel ${BENCHMARK.kontakteProFirma.text}</div></div>
+        <div data-liste="kontakte"><div class="w">${zahl(kl.length)}</div><div class="t">Personen angerufen · ${zahl(r.firmen)} Firmen</div></div>
+        <div data-liste="kontakte-gespraech"><div class="w">${zahl(mitG.length)}</div><div class="t">mit echtem Gespräch (${prozent(kl.length ? mitG.length / kl.length : null)})</div></div></div>
+      <div class="zwischentitel">Echtes Gespräch kam zustande beim … (Ø ${schnitt(versucheBis)} Versuche)</div>
       ${stufenBis.map(([l, n]) => `<div class="vert"><span>${l}</span><div class="spur"><i class="f-gespraech" style="width:${(n / maxBis * 100).toFixed(1)}%"></i></div>
         <span class="n num">${zahl(n)}</span><span class="p num">${prozent(mitG.length ? n / mitG.length : null)}</span></div>`).join('')}
       ${mitG.length && mitG.length < MINDEST_STICHPROBE ? '<p class="notiz-klein">' + kleinHinweis(mitG.length) + '</p>' : ''}
@@ -1643,8 +1777,17 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <td class="num${t.kleineStichprobe ? ' quote-unsicher' : ''}">${prozent(t.erreichtQuote)}</td>
         <td class="num${t.kleineStichprobe ? ' quote-unsicher' : ''}">${prozent(t.quote)}</td>
         <td class="num">${t.termin ? zahl(t.termin) : '–'}</td><td>${t.kleineStichprobe ? kleinHinweis(t.anrufe) : ''}</td></tr>`).join('')}</tbody></table></div>`;
+    const zielTabelle = `<div><div class="zwischentitel">Zielrolle</div>
+      <table class="tabelle firmen"><thead><tr><th>Klasse</th><th class="num neben">Kontakte</th><th class="num">Anrufe</th><th class="num">Echte Gespräche</th><th class="num">Termine</th><th class="num">Terminquote</th><th></th></tr></thead>
+      <tbody>${['A', 'B', 'C', 'nicht_zugeordnet', 'ohne_titel'].map(k => r.persona.ziel.find(t => t.name === k)).filter(Boolean).map(t => `<tr data-liste="ziel:${t.name}">
+        <td><strong>${esc(ZIELROLLEN_TEXT[t.name])}</strong></td><td class="num neben">${zahl(t.kontakte)}</td><td class="num">${zahl(t.anrufe)}</td>
+        <td class="num${t.kleineStichprobe ? ' quote-unsicher' : ''}">${zahl(t.gespraech)} · ${prozent(t.quote)}</td>
+        <td class="num">${t.termin ? zahl(t.termin) : '–'}</td>
+        <td class="num${t.terminKleineStichprobe ? ' quote-unsicher' : ''}">${prozent(t.terminQuote)}</td>
+        <td>${t.kleineStichprobe ? kleinHinweis(t.anrufe) : t.terminKleineStichprobe && t.gespraech ? kleinHinweis(t.gespraech) : ''}</td></tr>`).join('')}</tbody></table>
+      <p class="notiz-klein">A = besitzt die Rechnungsprüfung, B = kann weiterleiten, C = falsche Rolle. Terminquote = Termine je echtem Gespräch. „Nicht zugeordnet“: Titel passt zu keiner Klasse (z. B. CEO) – Liste ZIELROLLEN oben in index.html.</p></div>`;
     $('#persona').innerHTML = r.hatPersona
-      ? `<div class="persona-raster">${personaTabelle('Rolle', 'rolle', r.persona.rolle)}${personaTabelle('Unternehmensgröße', 'groesse', r.persona.groesse)}${personaTabelle('Branche', 'branche', r.persona.branche.slice(0, 10))}</div>
+      ? `<div class="persona-raster">${zielTabelle}${personaTabelle('Rolle', 'rolle', r.persona.rolle)}${personaTabelle('Unternehmensgröße', 'groesse', r.persona.groesse)}${personaTabelle('Branche', 'branche', r.persona.branche.slice(0, 10))}</div>
          <p class="notiz-klein">Rolle aus dem Jobtitel (Stichwortliste ROLLEN oben in index.html). „Erreicht“ = jemand abgenommen, „Gespräch“ = inhaltlich gesprochen.</p>`
       : `<div class="hinweis-box"><strong>Für die Persona-Auswertung fehlen im HubSpot-Export noch Spalten.</strong><br>
           Im HubSpot-Bericht „Anrufsnotizen“ unter <em>Bearbeiten</em> diese Eigenschaften hinzufügen, speichern und neu exportieren:<br>
@@ -1652,31 +1795,15 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
           · Unternehmen: <strong>Branche</strong> und <strong>Anzahl der Mitarbeiter</strong><br>
           Danach zeigt diese Karte Erreichbarkeit, Gesprächs- und Terminquote je Rolle, Unternehmensgröße und Branche.</div>`;
 
-    // KI und Regeln uneinig
-    $('#uneinigKarte').hidden = !mitKi;
-    if (mitKi) {
-      $('#uneinigKarte').innerHTML = `<details class="uneinig"${r.uneinig.length && r.uneinig.length <= 12 ? ' open' : ''}>
-        <summary><h2>KI und Stichwortregeln uneinig <span class="h2-zusatz">${zahl(r.uneinig.length)} Anrufe · zum Prüfen</span></h2><span class="pfeil">▾</span></summary>
-        ${r.uneinig.length ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Regel → KI</th><th>Notiz</th></tr></thead><tbody>
-        ${r.uneinig.map(a => `<tr>
-          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}</td>
-          <td>${esc(KATEGORIEN[a.regel.kategorie])}${a.regel.termin ? ' + Termin' : ''}<br><span class="pfeil">→</span> <strong>${esc(labelErgebnis(a.ki.ergebnis))}${a.ki.termin ? ' + Termin' : ''}</strong>
-            <div class="klein-text">Sicherheit ${prozent(a.ki.sicherheit)}${a.quelle === 'ki' ? '' : ' · zu unsicher, Regel zählt'}</div></td>
-          <td class="notiztext">${esc(a.notiz)}${a.ki.begruendung ? `<div class="klein-text">KI: ${esc(a.ki.begruendung)}</div>` : ''}</td></tr>`).join('')}
-        </tbody></table>` : '<p class="notiz-klein">Keine Abweichungen im Zeitraum.</p>'}</details>`;
-    }
+    // UNKLAR-Fälle separat
+    const unklar = r.anrufe.filter(a => a.kategorie === 'unklar');
+    $('#uneinigKarte').innerHTML = `<details class="uneinig"${unklar.length && unklar.length <= 12 ? ' open' : ''}>
+      <summary><h2>UNKLAR <span class="h2-zusatz">${zahl(unklar.length)} Anrufe ohne sichere Einordnung · zum Prüfen</span></h2><span class="pfeil">▾</span></summary>
+      ${anrufTabelle(unklar)}</details>`;
 
     // Gespräche
     $('#gespraecheZusatz').textContent = `${zahl(r.gespraeche.length)} im Zeitraum, chronologisch`;
-    $('#gespraeche').innerHTML = r.gespraeche.length ? `
-      <table class="tabelle gespraeche">
-        <thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Notiz</th></tr></thead>
-        <tbody>${r.gespraeche.map(a => `<tr>
-          <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin gebucht</span>' : ''}</td>
-          <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div>
-            ${a.interesse && a.interesse !== 'unklar' ? `<span class="chip ${esc(a.interesse)}">${esc(KI_INTERESSE[a.interesse])}</span>` : ''}</td>
-          <td class="notiztext">${esc(a.notiz)}${a.schritt ? `<div class="klein-text">→ ${esc(a.schritt)}</div>` : ''}</td></tr>`).join('')}</tbody>
-      </table>` : '<p class="notiz-klein">Keine Gespräche im Zeitraum.</p>';
+    $('#gespraeche').innerHTML = anrufTabelle(r.gespraeche);
 
     // Top-Firmen
     const top = r.topFirmen.slice(0, 10);
@@ -1700,13 +1827,22 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   /* ---------- Detail-Listen hinter Kacheln, Trichter und Ergebnissen ---------- */
   let letzteAuswertung = null;
+  const STUFE_ZU_KI = { gespraech: 'echtes_gespraech', abgewimmelt: 'abgewimmelt', niemand: 'kein_kontakt', unklar: 'unklar' };
+  const kannKorrigieren = () => !!(zustand.online && zustand.schluessel && speicher.get(TOKEN_SCHLUESSEL));
   const anrufZeile = a => `<tr>
     <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin</span>' : ''}</td>
-    <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div></td>
-    <td><span class="farbe f-${a.kategorie}"></span> ${esc(labelErgebnis(a.detail || a.kategorie))}</td>
-    <td class="notiztext">${esc(a.notiz)}</td></tr>`;
+    <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div>
+      ${a.jobtitel ? `<div class="klein-text">${esc(a.jobtitel.slice(0, 70))} · ${esc(zielrolleAus(a.jobtitel))}</div>` : ''}
+      <div class="klein-text">${esc(a.telefon || 'keine Nummer')} · ${esc(NUMMERNTYPEN[a.nummerTyp])}</div>
+      ${a.stand && a.stand !== 'unklar' ? `<span class="chip ${{ interesse: 'hoch', pending: 'mittel' }[a.stand] || ''}">${esc(KI_STAND[a.stand])}</span>` : ''}</td>
+    <td><span class="farbe f-${a.kategorie}"></span> <strong>${esc(KATEGORIEN[a.kategorie])}</strong>${a.stufeManuell ? ' <span class="chip">von Hand</span>' : ''}
+      ${a.beleg ? `<div class="beleg">„${esc(a.beleg)}“</div>` : ''}
+      ${a.detail && KI_ERGEBNISSE[a.detail] && a.kategorie === 'niemand' ? `<div class="klein-text">${esc(labelErgebnis(a.detail))}</div>` : ''}
+      ${kannKorrigieren() && a.engagementId ? `<br><select class="stufe-wahl" data-korrektur="${esc(a.engagementId)}" aria-label="Stufe korrigieren">
+        ${Object.entries(KI_STUFEN).map(([ki, k]) => `<option value="${ki}"${k === a.kategorie ? ' selected' : ''}>${esc(KATEGORIEN[k])}</option>`).join('')}</select>` : ''}</td>
+    <td class="notiztext">${esc(a.notiz)}${a.schritt ? `<div class="klein-text">→ ${esc(a.schritt)}</div>` : ''}</td></tr>`;
   const anrufTabelle = liste => liste.length
-    ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Ergebnis</th><th>Notiz</th></tr></thead>
+    ? `<table class="tabelle gespraeche"><thead><tr><th>Zeitpunkt</th><th>Kontakt</th><th>Stufe · Beleg</th><th>Notiz</th></tr></thead>
        <tbody>${liste.map(anrufZeile).join('')}</tbody></table>`
     : '<p class="notiz-klein">Keine Einträge.</p>';
 
@@ -1749,12 +1885,21 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       const filter = {
         anrufe: [`${zahl(r.anrufe.length)} Anrufe`, r.anrufe],
         gespraeche: [`${zahl(r.gespraeche.length)} Gespräche`, r.gespraeche],
-        erreicht: ['Jemand erreicht', r.anrufe.filter(a => a.kategorie !== 'niemand')],
-        interesse: ['Gespräche mit Interesse', r.gespraeche.filter(a => a.interesse === 'hoch' || a.interesse === 'mittel')],
+        erreicht: ['Kontakt hergestellt', r.anrufe.filter(a => a.kategorie === 'gespraech' || a.kategorie === 'abgewimmelt')],
+        interesse: ['Gespräche mit Interesse oder Termin', r.gespraeche.filter(a => a.stand === 'interesse' || a.termin)],
         termine: [`Termine aus Anrufen`, r.termine],
       }[schluessel];
       if (filter) [titel, html] = [filter[0], anrufTabelle(filter[1])];
-      else if (schluessel.startsWith('einwand:')) {
+      else if (schluessel.startsWith('stufe:')) {
+        const k = schluessel.slice(6), liste = r.anrufe.filter(a => a.kategorie === k);
+        [titel, html] = [`${KATEGORIEN[k]} · ${zahl(liste.length)}`, anrufTabelle(liste)];
+      } else if (schluessel.startsWith('ziel:')) {
+        const k = schluessel.slice(5), liste = r.anrufe.filter(a => zielrolleAus(a.jobtitel) === k);
+        [titel, html] = [`${ZIELROLLEN_TEXT[k]} · ${zahl(liste.length)} Anrufe`, anrufTabelle(liste)];
+      } else if (schluessel.startsWith('pipeline:')) {
+        const k = schluessel.slice(9), liste = r.pipeline[k] || [];
+        [titel, html] = [`${k === 'termin' ? 'Termin' : KI_STAND[k]} · ${zahl(liste.length)} Kontakte`, anrufTabelle(liste.map(e => e.anruf))];
+      } else if (schluessel.startsWith('einwand:')) {
         const k = schluessel.slice(8), liste = r.gespraeche.filter(a => a.einwand === k);
         [titel, html] = [`Einwand: ${KI_EINWAENDE[k] || k} · ${zahl(liste.length)}`, anrufTabelle(liste)];
       } else if (/^(rolle|branche|groesse):/.test(schluessel)) {
@@ -1799,6 +1944,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       const daten = leseAnrufe(zustand.text, zustand.versatz);
       wendeKiAn(daten.anrufe, zustand.ki);
       wendeKorrekturenAn(daten.anrufe, zustand.korrekturen);
+      wendeKorrekturenAn(daten.anrufe, zustand.korrekturNeu);
       zustand.daten = daten;
       zeigeFehler('');
     } catch (e) {
@@ -1870,6 +2016,67 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     return antwort.json();
   }
 
+  // Wartet auf den GitHub-Lauf zum Commit und lädt danach den neuen Stand
+  async function warteUndLade(sha, okText) {
+    const start = Date.now();
+    for (;;) {
+      await pause(10000);
+      const { workflow_runs: laeufe } = await github(`/actions/workflows/${WORKFLOW}/runs?per_page=10`);
+      const lauf = laeufe.find(l => l.head_sha === sha);
+      if (lauf?.status === 'completed') {
+        if (lauf.conclusion !== 'success') throw new Error(`Die Verarbeitung ist fehlgeschlagen. <a href="${esc(lauf.html_url)}" target="_blank" rel="noopener">Details bei GitHub</a>`);
+        break;
+      }
+      if (Date.now() - start > 25 * 60e3) throw new Error('Die Verarbeitung dauert ungewöhnlich lange. Bitte später neu laden.');
+    }
+    paket = await github('/contents/data/anrufe.enc.json', { roh: true });
+    await oeffne(zustand.schluessel, false);
+    zeigeStatus('ok', okText);
+  }
+
+  function zeigeKorrekturLeiste() {
+    const n = Object.keys(zustand.korrekturNeu?.stufe || {}).length;
+    let el = $('#korrekturLeiste');
+    if (!n) { el?.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = 'korrekturLeiste'; el.className = 'korrektur-leiste no-print'; document.body.appendChild(el); }
+    el.innerHTML = `<span><strong>${n} Korrektur${n === 1 ? '' : 'en'}</strong> noch nicht gespeichert – sie gelten bisher nur in diesem Browser.</span>
+      <span><button class="knopf leise" type="button" data-korrektur-verwerfen>Verwerfen</button> <button class="knopf" type="button" data-korrektur-speichern>Für alle speichern</button></span>`;
+  }
+
+  async function speichereKorrekturen() {
+    if (uploadLaeuft || !zustand.korrekturNeu) return;
+    uploadLaeuft = true;
+    try {
+      zeigeStatus('laeuft', 'Speichere Korrekturen …');
+      const up = await verschluessleMitSchluessel(JSON.stringify({ korrekturNeu: zustand.korrekturNeu, hochgeladen: new Date().toISOString() }),
+        zustand.schluessel, paket.salt, paket.runden);
+      const res = await github(`/contents/uploads/korrektur-${Date.now()}.enc.json`, {
+        method: 'PUT', body: JSON.stringify({ message: 'Korrekturen aus dem Board', content: btoa(JSON.stringify(up)) }),
+      });
+      zeigeStatus('laeuft', 'Korrekturen hochgeladen ✓ · werden übernommen (ca. 1 Minute) …');
+      await warteUndLade(res.commit.sha, '✓ Korrekturen gespeichert. Für alle anderen in 1–2 Minuten sichtbar.');
+      zustand.korrekturNeu = null;
+      zeigeKorrekturLeiste();
+      rechne();
+    } catch (e) {
+      zeigeStatus('fehler', `⚠ ${e.message.includes('<a ') ? e.message : esc(e.message)}`);
+    } finally {
+      uploadLaeuft = false;
+    }
+  }
+  document.addEventListener('change', e => {
+    const sel = e.target.closest('[data-korrektur]');
+    if (!sel) return;
+    zustand.korrekturNeu = zustand.korrekturNeu || { stufe: {} };
+    zustand.korrekturNeu.stufe[sel.dataset.korrektur] = sel.value;
+    rechne();
+    zeigeKorrekturLeiste();
+  });
+  document.addEventListener('click', e => {
+    if (e.target.closest('[data-korrektur-speichern]')) speichereKorrekturen();
+    if (e.target.closest('[data-korrektur-verwerfen]')) { zustand.korrekturNeu = null; zeigeKorrekturLeiste(); rechne(); }
+  });
+
   async function speichereUpload(text, quelle) {
     if (uploadLaeuft) { zeigeStatus('fehler', 'Es läuft schon ein Upload. Bitte warten.'); return; }
     uploadLaeuft = true;
@@ -1881,22 +2088,8 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       const res = await github(`/contents/uploads/upload-${Date.now()}.enc.json`, {
         method: 'PUT', body: JSON.stringify({ message: 'Upload aus dem Board', content: btoa(JSON.stringify(up)) }),
       });
-      const sha = res.commit.sha, start = Date.now();
       zeigeStatus('laeuft', 'Hochgeladen ✓ · Die KI ordnet neue Notizen ein. Das dauert meist 1–5 Minuten, du kannst weiterarbeiten.');
-      for (;;) {
-        await pause(10000);
-        const { workflow_runs: laeufe } = await github(`/actions/workflows/${WORKFLOW}/runs?per_page=10`);
-        const lauf = laeufe.find(l => l.head_sha === sha);
-        if (lauf?.status === 'completed') {
-          if (lauf.conclusion !== 'success') throw new Error(`Die Verarbeitung ist fehlgeschlagen. <a href="${esc(lauf.html_url)}" target="_blank" rel="noopener">Details bei GitHub</a>`);
-          break;
-        }
-        if (Date.now() - start > 25 * 60e3) throw new Error('Die Verarbeitung dauert ungewöhnlich lange. Bitte später neu laden.');
-      }
-      // Neuen Stand direkt über die API holen, ohne auf GitHub Pages zu warten
-      paket = await github('/contents/data/anrufe.enc.json', { roh: true });
-      await oeffne(zustand.schluessel, false);
-      zeigeStatus('ok', '✓ Neuer Stand gespeichert und per KI eingeordnet. Für alle anderen ist er in 1–2 Minuten sichtbar.');
+      await warteUndLade(res.commit.sha, '✓ Neuer Stand gespeichert und per KI eingeordnet. Für alle anderen ist er in 1–2 Minuten sichtbar.');
     } catch (e) {
       zeigeStatus('fehler', `⚠ ${e.message.includes('<a ') ? e.message : esc(e.message)}`);
     } finally {
@@ -2035,7 +2228,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     const v = parseFloat($('#versatz').value);
     if (!Number.isFinite(v)) return;
     zustand.versatz = v;
-    speicher.set('adric.versatz', String(v));
+    speicher.set('adric.versatz.v2', String(v));
     rechne();
   });
 

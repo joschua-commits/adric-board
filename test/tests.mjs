@@ -45,7 +45,7 @@ test('Trennzeichen-Erkennung ignoriert Zeichen in Anführungszeichen', () => {
 console.log('\nKlassifikation, Nummerntyp, Datum');
 test('Klassifikation inkl. Vorrang von Liste 1', () => {
   assert.equal(A.klassifiziere('VOICEMAIL').kategorie, 'niemand');
-  assert.equal(A.klassifiziere('Abwesenheitsnotiz').kategorie, 'falsch');
+  assert.equal(A.klassifiziere('Abwesenheitsnotiz').kategorie, 'abgewimmelt');
   assert.equal(A.klassifiziere('Mailbox, laut Ansage Urlaub bis Montag').kategorie, 'niemand');
   assert.equal(A.klassifiziere('Gutes Gespräch, Demo am Freitag').kategorie, 'gespraech');
   assert.equal(A.klassifiziere('Drückt mich weg').kategorie, 'niemand');
@@ -59,7 +59,7 @@ test('Tippfehler und Ergänzungen aus dem echten Export', () => {
   assert.equal(k('mobilbox'), 'niemand');
   assert.equal(k('keine handynummer hinterlegt'), 'niemand');
   assert.equal(k('zentrale blockt ab'), 'niemand');
-  assert.equal(k('ist schon im ruhestand'), 'falsch');
+  assert.equal(k('ist schon im ruhestand'), 'abgewimmelt');
   // dürfen NICHT treffen
   assert.equal(k('ist im urlaub, aber gerne ab dem 17. august'), 'gespraech');
   assert.equal(k('Unternehmen Nichtrostend GmbH, gutes Gespräch'), 'gespraech');
@@ -78,15 +78,18 @@ test('Termin gebucht: Treffer und Fallen aus dem echten Export', () => {
   assert.equal(t('Termin wäre schön. Verträge werden vereinbart'), false);              // nicht über den Punkt
   assert.equal(t('Mailbox, Termin für Freitag vereinbart?'), false);                    // niemand erreicht gewinnt
 });
-test('Nummerntyp', () => {
+test('Nummerntyp: Handy, Durchwahl, Zentrale', () => {
   const f = A.nummernTyp;
-  assert.equal(f('+49 151 2345678'), 'mobil');
-  assert.equal(f('+49 (0)171 2345678'), 'mobil');
-  assert.equal(f('0049 160 1'), 'mobil');
-  assert.equal(f('0176/1234567'), 'mobil');
-  assert.equal(f('+49 89 12345-678'), 'festnetz');
-  assert.equal(f('+49 (0)711 987654'), 'festnetz');
-  assert.equal(f('0711 222333'), 'festnetz');
+  assert.equal(f('+49 151 2345678'), 'handy');
+  assert.equal(f('+49 (0)171 2345678'), 'handy');
+  assert.equal(f('0049 160 1'), 'handy');
+  assert.equal(f('0176/1234567'), 'handy');
+  assert.equal(f('+49 89 12345-678'), 'durchwahl');
+  assert.equal(f('+49 (0)711 987654'), 'durchwahl');
+  assert.equal(f('0711 222333'), 'durchwahl');
+  assert.equal(f('+49 40 555666'), 'zentrale');      // kurz
+  assert.equal(f('+49 711 123450'), 'zentrale');     // endet auf 0
+  assert.equal(f('0800 1234567'), 'zentrale');
   assert.equal(f('+43 1 5321234'), 'ausland');
   assert.equal(f('+41 171 1234567'), 'ausland');
   assert.equal(f(''), 'keine');
@@ -125,14 +128,14 @@ test('Mehrzeilige Notiz bleibt vollständig', () => {
 });
 
 const alles = A.auswerten(anrufe, null, null);
-test('Alles: 19 Anrufe, 6 Gespräche, 9 niemand, 4 falsch, 14 Kontakte, 8 Firmen, 8 Tage', () => {
+test('Alles: 19 Anrufe, 6 Gespräche, 9 niemand, 4 abgewimmelt, 14 Kontakte, 8 Firmen, 8 Tage', () => {
   const g = alles.gesamt;
-  assert.deepEqual([g.anrufe, g.gespraech, g.niemand, g.falsch], [19, 6, 9, 4]);
+  assert.deepEqual([g.anrufe, g.gespraech, g.niemand, g.abgewimmelt], [19, 6, 9, 4]);
   assert.deepEqual([alles.kontakte, alles.firmen, alles.telefontage], [14, 8, 8]);
 });
 test('Alles: Nummerntypen', () => {
   const n = Object.fromEntries(alles.proNummerTyp.map(t => [t.typ, [t.anrufe, t.gespraech]]));
-  assert.deepEqual(n, { mobil: [6, 0], festnetz: [9, 4], ausland: [2, 2], keine: [2, 0] });
+  assert.deepEqual(n, { handy: [6, 0], durchwahl: [6, 3], zentrale: [3, 1], ausland: [2, 2], keine: [2, 0] });
 });
 test('Alles: Top-Firmen', () => {
   assert.deepEqual(alles.topFirmen.slice(0, 4).map(f => [f.name, f.anrufe, f.gespraech]), [
@@ -145,7 +148,7 @@ const zw = A.zeitraum('woche', '2026-10-01');
 const woche = A.auswerten(anrufe, zw.von, zw.bis);
 test('Diese Woche: 15 Anrufe, 4 Gespräche, 13 Kontakte, 7 Firmen, 4 Tage', () => {
   const g = woche.gesamt;
-  assert.deepEqual([g.anrufe, g.gespraech, g.niemand, g.falsch], [15, 4, 7, 4]);
+  assert.deepEqual([g.anrufe, g.gespraech, g.niemand, g.abgewimmelt], [15, 4, 7, 4]);
   assert.deepEqual([woche.kontakte, woche.firmen, woche.telefontage], [13, 7, 4]);
   assert.equal(g.kleineStichprobe, false);
   assert.deepEqual([g.termin, woche.termine.map(a => a.engagementId)], [1, ['1010']]);
@@ -205,10 +208,10 @@ testA('KI-Ergebnis übernimmt Kategorie, Detail und Termin', async () => {
     '1001': { h: A.notizHash(b.notiz), ergebnis: 'gespraech', termin: false, interesse: 'keins', sicherheit: 0.4 },   // unsicher
   };
   A.wendeKiAn(liste, ki);
-  assert.deepEqual([a.quelle, a.kategorie, a.detail, a.termin, a.interesse, a.uneinig], ['ki', 'gespraech', 'gespraech', true, 'hoch', true]);
-  assert.deepEqual([b.quelle, b.kategorie, b.uneinig], ['regel', 'niemand', true]);
+  assert.deepEqual([a.quelle, a.kategorie, a.detail, a.termin, a.stand], ['ki', 'gespraech', 'gespraech', true, 'interesse']);
+  assert.deepEqual([b.quelle, b.kategorie], ['ki', 'unklar']);                 // unsicher → UNKLAR statt raten
   const r = A.auswerten(liste, null, null);
-  assert.deepEqual([r.kiAnzahl, r.unsicher.length, r.uneinig.length, r.gesamt.termin], [1, 1, 2, 2]);
+  assert.deepEqual([r.kiAnzahl, r.unsicher.length, r.gesamt.unklar, r.gesamt.termin], [2, 1, 1, 2]);
 });
 testA('Termine ohne Anruf zählen nur im Zeitraum und nicht in Gesprächsquoten', async () => {
   const { anrufe: liste } = A.leseAnrufe(csv, 5);
@@ -221,6 +224,30 @@ testA('Korrektur von Hand markiert einen Anruf als Termin', async () => {
   A.wendeKorrekturenAn(liste, { termin: { '1007': true, '1010': false } });
   const a = liste.find(x => x.engagementId === '1007'), b = liste.find(x => x.engagementId === '1010');
   assert.deepEqual([a.termin, a.manuell, b.termin], [true, true, false]);
+});
+testA('KI-Stufe mit Beleg und Korrektur von Hand', async () => {
+  const { anrufe: l } = A.leseAnrufe(csv, 5);
+  const x = l.find(a => a.engagementId === '1014');
+  A.wendeKiAn(l, { '1014': { h: A.notizHash(x.notiz), ergebnis: 'gespraech', stufe: 'abgewimmelt', beleg: 'kein Budget', sicherheit: 0.9 } });
+  assert.deepEqual([x.kategorie, x.beleg], ['abgewimmelt', 'kein Budget']);
+  A.wendeKorrekturenAn(l, { stufe: { '1014': 'echtes_gespraech' } });
+  assert.deepEqual([x.kategorie, x.stufeManuell], ['gespraech', true]);
+});
+testA('Zielrollen A/B/C', async () => {
+  const z = A.zielrolleAus;
+  assert.equal(z('Head of Indirect Procurement'), 'A');
+  assert.equal(z('Leiter Kreditorenbuchhaltung'), 'A');
+  assert.equal(z('Head of Logistics'), 'A');
+  assert.equal(z('Head of Procurement'), 'B');
+  assert.equal(z('CFO'), 'B');
+  assert.equal(z('Kaufmännischer Leiter (Prokurist) - Commercial Head'), 'B');
+  assert.equal(z('MD Finance Körber Supply Chain Parcel Logistics Germany'), 'B');
+  assert.equal(z('Head of Corporate Finance & Treasury'), 'C');
+  assert.equal(z('Commodity-Managerin - Strategischer Einkauf'), 'C');
+  assert.equal(z('Innovation Manager'), 'C');
+  assert.equal(z('Manager Financial & Procurement Applications'), 'C');
+  assert.equal(z('CEO'), 'nicht_zugeordnet');
+  assert.equal(z(''), 'ohne_titel');
 });
 testA('Persona: Rollen und Unternehmensgröße', async () => {
   const r = A.rolleAus;
@@ -265,6 +292,19 @@ testA('Jobtitel kommt über die Kontakt ID aus Zeilen ohne Notiz', async () => {
             '"gutes Gespräch",(Kein Wert),2026-09-29 05:00,7\n(Kein Wert),Head of Controlling,2026-09-20 05:00,7\n"Mailbox",(Kein Wert),2026-09-29 06:00,8\n';
   const { anrufe: l } = A.leseAnrufe(t, 0);
   assert.deepEqual(l.map(a => [a.kontaktId, a.jobtitel]), [['7', 'Head of Controlling'], ['8', '']]);
+});
+testA('Pipeline: Pending je Kontakt, auch von Hand für nicht erreichte Kontakte', async () => {
+  const { anrufe: l } = A.leseAnrufe(csv, 5);
+  const h = id => A.notizHash(l.find(x => x.engagementId === id).notiz);
+  A.wendeKiAn(l, {
+    '1002': { h: h('1002'), ergebnis: 'gespraech', stand: 'pending', sicherheit: 0.9 },
+    '1016': { h: h('1016'), ergebnis: 'gespraech', stand: 'interesse', sicherheit: 0.9 },
+  });
+  A.wendeKorrekturenAn(l, { stand: { '1015': 'pending' } });          // Anna Müller, nicht erreicht, aber offen
+  const r = A.auswerten(l, null, null);
+  assert.deepEqual(r.pipeline.pending.map(e => e.name).sort(), ['Anna Müller', 'Peter Schmidt']);
+  assert.deepEqual(r.pipeline.interesse.map(e => e.name), ['Udo Klein']);
+  assert.deepEqual(r.pipeline.termin.map(e => e.name), ['Maren Jensen']);
 });
 testA('KI-Eintrag mit veraltetem Notiz-Hash wird ignoriert', async () => {
   const { anrufe: liste } = A.leseAnrufe(csv, 5);
