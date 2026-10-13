@@ -159,7 +159,11 @@ const csvNeu = A.alsAnrufCsv(anrufe);
 
 /* ---------- 2. KI-Klassifikation ---------- */
 mkdirSync(LOKAL, { recursive: true, mode: 0o700 });
-const cache = { ...(alt?.ki || {}), ...(existsSync(CACHE) ? JSON.parse(readFileSync(CACHE, 'utf8')) : {}) };
+// Bekannte Einordnungen: Online-Stand und lokaler Cache – je Anruf gewinnt die neuere Prompt-Version
+const cache = { ...(alt?.ki || {}) };
+for (const [k, e] of Object.entries(existsSync(CACHE) ? JSON.parse(readFileSync(CACHE, 'utf8')) : {})) {
+  if (!cache[k] || (e.v || 0) > (cache[k].v || 0)) cache[k] = e;
+}
 const aktuell = a => { const k = cache[A.kiSchluessel(a)]; return k?.h === A.notizHash(a.notiz) && k.v === PROMPT_VERSION; };
 const offen = anrufe.filter(a => !aktuell(a));
 let modell = alt?.modell || null;
