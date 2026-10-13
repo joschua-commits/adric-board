@@ -3,6 +3,7 @@
 //
 //   Auf dem Mac:      node tools/update.mjs <export.zip|anrufsnotizen.csv> [--neues-passwort] [--nur-regeln]
 //   In der Action:    node tools/update.mjs --upload uploads/<datei>.enc.json
+//   Passwort ändern:  node tools/update.mjs --passwort-aendern
 //
 // 1. liest den Export (bzw. den verschlüsselten Upload aus dem Board)
 // 2. lässt NUR neue oder geänderte Notizen von OpenAI einordnen; bekannte Einordnungen
@@ -41,7 +42,8 @@ const uploadDatei = uploadIdx >= 0 ? args[uploadIdx + 1] : null;
 const datei = uploadDatei ? null : args.find(a => !a.startsWith('--'));
 const neuesPasswort = args.includes('--neues-passwort');
 const nurRegeln = args.includes('--nur-regeln');
-if (!datei && !uploadDatei) {
+const passwortAendern = args.includes('--passwort-aendern');
+if (!datei && !uploadDatei && !passwortAendern) {
   console.error('Aufruf: node tools/update.mjs <export.zip|csv> [--neues-passwort] [--nur-regeln]\n   oder: node tools/update.mjs --upload <datei.enc.json>');
   process.exit(1);
 }
@@ -79,21 +81,41 @@ function passwortSchwach(pw) {
   if (/passwort|password|adric|hubspot|123456|qwertz|qwerty/i.test(pw)) return 'keine naheliegenden Wörter (passwort, adric, 123456 …)';
   return null;
 }
-async function holePasswort() {
-  if (process.env.BOARD_PASSWORT && !neuesPasswort) return process.env.BOARD_PASSWORT.replace(/\n$/, '');
-  const ausBund = neuesPasswort ? null : keychainLesen();
-  if (ausBund) return ausBund;
+async function frageNeuesPasswort(bisher = null) {
   if (!process.stdin.isTTY) throw new Error('Kein Passwort (BOARD_PASSWORT oder Schlüsselbund). Im Terminal ausführen, um es zu setzen.');
   console.log('\nLege das Passwort für die Online-Daten fest. Es wird im Schlüsselbund gespeichert und nie angezeigt.');
   for (;;) {
     const p1 = await verdeckt('Neues Passwort: ');
     const schwach = passwortSchwach(p1);
     if (schwach) { console.log(`  Zu schwach: ${schwach}.`); continue; }
+    if (p1 === bisher) { console.log('  Das ist das bisherige Passwort.'); continue; }
     if (p1 !== await verdeckt('Wiederholen:    ')) { console.log('  Stimmt nicht überein.'); continue; }
-    keychainSchreiben(p1);
-    console.log('Passwort im Schlüsselbund gespeichert.');
     return p1;
   }
+}
+async function holePasswort() {
+  if (process.env.BOARD_PASSWORT && !neuesPasswort) return process.env.BOARD_PASSWORT.replace(/\n$/, '');
+  const ausBund = neuesPasswort ? null : keychainLesen();
+  if (ausBund) return ausBund;
+  const p = await frageNeuesPasswort();
+  keychainSchreiben(p);
+  console.log('Passwort im Schlüsselbund gespeichert.');
+  return p;
+}
+
+/* ---------- Passwort ändern: Online-Stand mit neuem Passwort und neuem Salt neu verschlüsseln ---------- */
+if (passwortAendern) {
+  const bisher = keychainLesen();
+  if (!bisher) throw new Error('Kein bisheriges Passwort im Schlüsselbund.');
+  const { inhalt } = await A.entschluessle(JSON.parse(readFileSync(ZIEL, 'utf8')), bisher);
+  console.log(`Aktueller Online-Stand entschlüsselt (${inhalt.quelle}).`);
+  const neu = await frageNeuesPasswort(bisher);
+  const paket = await A.verschluessle(JSON.stringify(inhalt), neu, crypto.getRandomValues(new Uint8Array(16)));
+  if ((await A.entschluessle(paket, neu)).inhalt.csv !== inhalt.csv) throw new Error('Gegenprobe fehlgeschlagen.');
+  writeFileSync(ZIEL, JSON.stringify(paket));
+  keychainSchreiben(neu);
+  console.log('Neu verschlüsselt und im Schlüsselbund gespeichert. Gemerkte Zugänge in Browsern sind damit ungültig.');
+  process.exit(0);
 }
 
 const passwort = await holePasswort();
