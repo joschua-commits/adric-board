@@ -306,6 +306,65 @@ testA('Pipeline: Pending je Kontakt, auch von Hand für nicht erreichte Kontakte
   assert.deepEqual(r.pipeline.interesse.map(e => e.name), ['Udo Klein']);
   assert.deepEqual(r.pipeline.termin.map(e => e.name), ['Maren Jensen']);
 });
+// Termin-Attribution: die beiden Fälle aus der Praxis, nachgebaut mit den Testdaten
+const referralTermin = {   // Fall 1: Kaltanruf bei Schmidt, verweist an Mittelstädt, Termin per LinkedIn
+  datum: '2026-09-30', listenkontakt: { name: 'Peter Schmidt', firma: 'Schmidt & Söhne KG' },
+  kontakt: { name: 'Nicholas Mittelstädt', firma: 'thyssenkrupp' }, quelle: 'cold_call', referral: true,
+  kette: 'Cold Call (Schmidt) -> Referral -> LinkedIn (Mittelstädt)', kanal: 'linkedin', anrufId: '1002',
+};
+const listenTermin = {     // Fall 2: Liste sagt Hahner, gesprochen (und gebucht per Mail) mit Jensen
+  datum: '2026-09-30', listenkontakt: { name: 'Kevin Hahner', firma: 'Nordlicht Steuerberatung' },
+  kontakt: { name: 'Maren Jensen', firma: 'Nordlicht Steuerberatung' }, quelle: 'cold_call', referral: false,
+  kette: 'Cold Call, Listenkontakt Hahner, real Jensen', kanal: 'email', anrufId: '1010',
+};
+function mitTerminen(termine) {
+  const { anrufe: l } = A.leseAnrufe(csv, 5);
+  A.wendeKiAn(l, { '1002': { h: A.notizHash(l.find(x => x.engagementId === '1002').notiz), ergebnis: 'gespraech', stand: 'pending', sicherheit: 0.9 } });
+  const eintraege = A.terminEintraegeAus([{ termine }]);
+  A.wendeTermineAn(l, eintraege);
+  return A.auswerten(l, null, null, eintraege);
+}
+test('Termin-Eintrag: Pflichtfelder, Referral-Quelle braucht Referral in der Kette', () => {
+  assert.deepEqual(A.pruefeTermin({ ...referralTermin, id: 'x' }).fehler, []);
+  const f = A.pruefeTermin({ id: 'x', datum: '2026-09-30' }).fehler.join(' ');
+  for (const w of ['Name fehlt', 'Firma fehlt', 'Quelle', 'Ja oder Nein', 'Kette', 'Buchungskanal']) assert.match(f, new RegExp(w));
+  assert.match(A.pruefeTermin({ ...referralTermin, id: 'x', quelle: 'referral', referral: false }).fehler.join(), /Referral/);
+  assert.match(A.pruefeTermin({ ...referralTermin, id: 'x', quelle: 'geraten' }).fehler.join(), /Quelle wählen/);
+});
+test('Gleiche Person trotz Umlaut-Schreibweise (Kämper = Kaemper)', () => {
+  assert.equal(A.personSchluessel('Christian Kämper'), A.personSchluessel('christian  KAEMPER'));
+  assert.notEqual(A.personSchluessel('Kevin Hahner'), A.personSchluessel('Andreas Kessler'));
+});
+test('Fall 1 Referral: ein Termin, konvertiert ist Mittelstädt, nicht der Angerufene', () => {
+  const r = mitTerminen({ t1: referralTermin });
+  // Termine: der Eintrag + Jensen (Termin laut Notiz, Herkunft nicht erfasst)
+  assert.deepEqual(r.terminListe.map(t => [t.kontakt.name, t.erfasst]), [['Maren Jensen', false], ['Nicholas Mittelstädt', true]]);
+  assert.deepEqual([r.terminKpi.gesamt, r.terminKpi.referral, r.terminKpi.referralQuote, r.terminKpi.nichtErfasst], [2, 1, 1, 1]);
+  assert.deepEqual(r.pipeline.termin.map(e => e.name).sort(), ['Maren Jensen', 'Nicholas Mittelstädt']);
+  assert.deepEqual(r.pipeline.pending.map(e => e.name), ['Peter Schmidt']);        // bleibt mit eigenem Stand
+  assert.equal(r.kontaktListe.find(k => k.name === 'Peter Schmidt').termin, false);
+  assert.equal(r.gesamt.termin, 2);                                                  // Anruf-Kennzahl: Ausgangsanruf führte zum Termin
+});
+test('Fall 2 Listenkontakt ≠ real: Anruf mit Termin und Eintrag zählen zusammen genau einmal', () => {
+  const r = mitTerminen({ t2: listenTermin });
+  assert.equal(r.terminListe.length, 1);
+  assert.deepEqual([r.terminKpi.abweichend, r.terminKpi.referral, r.terminKpi.nichtErfasst, r.terminKpi.kanal.email], [1, 0, 0, 1]);
+  assert.deepEqual(r.pipeline.termin.map(e => e.name), ['Maren Jensen']);           // nicht Hahner
+});
+test('Beide Fälle zusammen: 2 Termine, 1 mit Referral (50 %), Stichprobe als klein markiert', () => {
+  const r = mitTerminen({ t1: referralTermin, t2: listenTermin });
+  const k = r.terminKpi;
+  assert.deepEqual([k.gesamt, k.erfasst, k.referral, k.referralQuote, k.abweichend, k.referralKleineStichprobe], [2, 2, 1, 0.5, 2, true]);
+  assert.deepEqual([k.quelle.cold_call, k.kanal.linkedin, k.kanal.email], [2, 1, 1]);
+});
+test('Gelöschter Eintrag (null) zählt nicht, späterer Stand gewinnt, Zeitraum nach Buchungsdatum', () => {
+  const e = A.terminEintraegeAus([{ termine: { t1: referralTermin, t2: listenTermin } }, { termine: { t1: null, t2: { ...listenTermin, datum: '2026-10-06' } } }]);
+  assert.deepEqual(e.map(t => [t.id, t.datum]), [['t2', '2026-10-06']]);
+  const { anrufe: l } = A.leseAnrufe(csv, 5);
+  A.wendeTermineAn(l, e);
+  assert.equal(A.auswerten(l, '2026-09-28', '2026-10-04', e).terminListe.length, 0);   // Anruf 1010 ist verknüpft, Termin liegt in der Woche danach
+  assert.equal(A.auswerten(l, '2026-10-05', '2026-10-11', e).terminListe.length, 1);
+});
 testA('KI-Eintrag mit veraltetem Notiz-Hash wird ignoriert', async () => {
   const { anrufe: liste } = A.leseAnrufe(csv, 5);
   A.wendeKiAn(liste, { '1001': { h: '00000000', ergebnis: 'gespraech', sicherheit: 1 } });

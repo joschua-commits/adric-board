@@ -338,10 +338,14 @@ const termineOhneAnruf = (existsSync(OHNE_ANRUF) ? JSON.parse(readFileSync(OHNE_
 
 A.wendeKiAn(anrufe, ki);
 A.wendeKorrekturenAn(anrufe, korrekturen);
-const r = A.auswerten(anrufe, null, null, termineOhneAnruf);
+const termine = A.terminEintraegeAus([korrekturen], termineOhneAnruf);   // Termin-Einträge (korrekturen.termine) + alte ohne Anruf
+A.wendeTermineAn(anrufe, termine);
+const r = A.auswerten(anrufe, null, null, termine);
 console.log(`KI-Einordnung für ${anrufe.filter(a => a.ki).length}/${anrufe.length} Anrufe · ${r.unsicher.length} unsicher (→ UNKLAR)`);
 const g = r.gesamt;
-console.log(`Ergebnis: ${g.anrufe} Anrufe · ${g.gespraech} echte Gespräche · ${g.abgewimmelt} abgewimmelt · ${g.niemand} kein Kontakt · ${g.unklar} UNKLAR · ${g.termin + r.termineOhneAnruf.length} Termine`);
+console.log(`Ergebnis: ${g.anrufe} Anrufe · ${g.gespraech} echte Gespräche · ${g.abgewimmelt} abgewimmelt · ${g.niemand} kein Kontakt · ${g.unklar} UNKLAR · ${r.terminListe.length} Termine`);
+const tk = r.terminKpi;
+console.log(`Termine: ${tk.erfasst} mit erfasster Herkunft · ${tk.referral} mit Referral in der Kette · ${tk.abweichend} Listenkontakt ≠ tatsächlicher Kontakt · ${tk.nichtErfasst} Herkunft nicht erfasst`);
 
 /* ---------- 3. Verschlüsseln ---------- */
 const inhalt = { version: 2, erstellt: new Date().toISOString(), quelle, modell, stat, csv: csvNeu, ki, termineOhneAnruf, korrekturen };

@@ -269,6 +269,7 @@ const BENCHMARK = {
   versucheProKontakt: { text: '6–8', rotUnter: 2 },
   kontakteProFirma:   { text: '3–5', rotUnter: 2 },
   nummerntyp: { handy: '15–22 % (Cognism, verifizierte Handynummern)', zentrale: '3–6 % (Cognism)' },
+  referral: '35 % Connect über Empfehlung gegenüber 3–6 % über Zentralen',
 };
 // Handy = +49 15x/16x/17x. Zentrale = 0800, endet auf 0 oder ist kurz (Rufnummer ohne +49 und
 // ohne führende 0 höchstens ZENTRALE_MAX_STELLEN Ziffern). Alles andere Deutsche = Durchwahl.
@@ -644,12 +645,14 @@ function kontaktSchluessel(a) {
   return 'name:' + name + '|' + a.telefon.replace(/\D/g, '');
 }
 
-// termineOhneAnruf: von Hand gepflegte Termine, die nicht aus einem Anruf kamen
-// ([{ datum: 'JJJJ-MM-TT', firma, name, notiz }]). Sie zählen bei den Terminen mit,
-// aber nicht in Gesprächsquoten oder im Trichter.
-function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
+// termine: Termin-Einträge aus terminEintraegeAus() (oder alte termineOhneAnruf
+// [{ datum: 'JJJJ-MM-TT', firma, name, notiz }]). Gezählt wird je Eintrag nach Buchungsdatum;
+// Gesprächsquoten und Trichter bleiben reine Anruf-Kennzahlen.
+function auswerten(alleAnrufe, von, bis, termine = []) {
   const imZeitraum = tag => (!von || tag >= von) && (!bis || tag <= bis);
   const anrufe = alleAnrufe.filter(a => imZeitraum(a.tag));
+  const eintraege = (termine || []).every(t => t && t.kontakt) ? (termine || []) : terminEintraegeAus([], termine);
+  const terminListe = terminListeAus(alleAnrufe, eintraege, imZeitraum);
 
   const gesamt = leererTopf();
   const kontakte = new Set();
@@ -674,11 +677,13 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     details[det] = (details[det] || 0) + 1;
     if (a.kategorie === 'gespraech' && a.stand) staende[a.stand] = (staende[a.stand] || 0) + 1;
     {
-      // Pipeline je Kontakt: Termin schlägt alles, sonst gilt der Stand des letzten Anrufs mit Stand
+      // Pipeline je Kontakt: Termin schlägt alles, sonst gilt der Stand des letzten Anrufs mit Stand.
+      // Termin nur, wenn der Angerufene selbst der tatsächliche Kontakt ist (sonst steht der unten).
       const pk = kontaktSchluessel(a);
-      if (pk && (a.termin || a.stand)) {
+      const konvertiert = anrufKontaktKonvertiert(a);
+      if (pk && (konvertiert || a.stand)) {
         const e = pipe.get(pk) || { name: `${a.vorname} ${a.nachname}`.trim() || '–', firma: a.firma, jobtitel: a.jobtitel, status: null, anruf: null };
-        if (a.termin) { e.status = 'termin'; e.anruf = a; }
+        if (konvertiert) { e.status = 'termin'; e.anruf = a; }
         else if (e.status !== 'termin') { e.status = a.stand; e.anruf = a; }
         pipe.set(pk, e);
       }
@@ -690,7 +695,7 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
       const k = proKontakt.get(kk);
       k.versuche++;
       if (a.kategorie === 'gespraech') { k.gespraeche++; if (k.bisGespraech == null) k.bisGespraech = k.versuche; }
-      if (a.termin) k.termin = true;
+      if (anrufKontaktKonvertiert(a)) k.termin = true;
       k.letzter = a;                                   // Anrufe sind chronologisch sortiert
     }
     for (const [map, wert] of [[persona.ziel, zielrolleAus(a.jobtitel)], [persona.rolle, rolleAus(a.jobtitel)], [persona.branche, a.branche || 'Unbekannt'], [persona.groesse, groesseAus(a.mitarbeiter)]]) {
@@ -714,6 +719,15 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     zaehle(nummern[a.nummerTyp], a);
   }
 
+  // Tatsächliche Kontakte, die nicht selbst angerufen wurden (Weiterleitung, LinkedIn, Inbound …)
+  for (const t of terminListe) {
+    const p = personSchluessel(t.kontakt.name);
+    const angerufen = t.anruf && p && personSchluessel(`${t.anruf.vorname} ${t.anruf.nachname}`) === p;
+    if (angerufen && imZeitraum(t.anruf.tag)) continue;
+    const pk = 'person:' + p + '|' + personSchluessel(t.kontakt.firma);
+    pipe.set(pk, { name: t.kontakt.name || '–', firma: t.kontakt.firma, jobtitel: t.kontakt.rolle, status: 'termin', anruf: t.anruf, termin: t });
+  }
+
   const topFirmen = [...firmen.values()]
     .map(f => mitQuote(Object.assign(f, { kontakte: f.kontakte.size })))
     .sort((x, y) => y.anrufe - x.anrufe || y.gespraech - x.gespraech || x.name.localeCompare(y.name, 'de'));
@@ -730,8 +744,10 @@ function auswerten(alleAnrufe, von, bis, termineOhneAnruf = []) {
     proStunde: stunden.map((t, h) => Object.assign(mitQuote(t), { stunde: h })),
     proNummerTyp: Object.entries(nummern).map(([typ, t]) => Object.assign(mitQuote(t), { typ, label: NUMMERNTYPEN[typ] })),
     gespraeche: anrufe.filter(a => a.kategorie === 'gespraech'),
-    termine: anrufe.filter(a => a.termin),
-    termineOhneAnruf: (termineOhneAnruf || []).filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.datum) && imZeitraum(t.datum)),
+    termine: anrufe.filter(a => a.termin),            // Anrufe, die zu einem Termin führten
+    terminListe,                                      // je Termin genau ein Eintrag
+    terminKpi: terminKennzahlen(terminListe),
+    termineOhneAnruf: terminListe.filter(t => !t.anruf),
     topFirmen,
     heat: heat.map(zeile => zeile.map(mitQuote)),
     details,                       // Ergebnis -> Anzahl (KI-Ergebnis oder Regel-Gruppe)
@@ -807,6 +823,133 @@ function wendeKorrekturenAn(anrufe, korrekturen) {
     a.manuell = true;
   }
   return anrufe;
+}
+
+/* =====================================================================
+   TERMINE: QUELLE UND ATTRIBUTION
+   Termine entstehen oft über Umwege (Weiterleitung, falscher Listenkontakt).
+   Ein Termin-Eintrag wird von Hand angelegt, nichts wird geraten:
+   { id, datum, listenkontakt: { name, firma }, kontakt: { name, firma, rolle },
+     quelle, referral, kette, kanal, anrufId, notiz }
+   - kontakt:       tatsächlicher Kontakt. Er zählt als konvertierter Kontakt.
+   - listenkontakt: wer in Kampagne/Liste zugewiesen war (optional, nur zur Info).
+   - anrufId:       Engagement ID des Anrufs, mit dem die Kette begann (optional).
+   Jeder Eintrag ist GENAU EIN Termin, egal wie viele Personen in der Kette stehen.
+   Anrufe mit Termin (KI oder Korrektur) ohne Eintrag zählen weiter einzeln mit,
+   sind aber als "Herkunft nicht erfasst" markiert. Ist ein Eintrag mit dem Anruf
+   verknüpft, zählt nur der Eintrag.
+   Gespeichert in korrekturen.termine: { [id]: Eintrag | null }  (null = gelöscht)
+   ===================================================================== */
+const TERMIN_QUELLEN = { cold_call: 'Cold Call', linkedin: 'LinkedIn', inbound: 'Inbound', referral: 'Empfehlung/Referral', bestand: 'Bestandskontakt' };
+const TERMIN_KANAELE = { telefon: 'Telefon', linkedin: 'LinkedIn', email: 'E-Mail' };
+
+const terminText = (v, max = 160) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max);
+// Gleiche Person? Nur Schreibweise angleichen (Kämper = Kaemper), keine Ähnlichkeitssuche
+function personSchluessel(name) {
+  return terminText(name).toLowerCase()
+    .replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]+/g, '');
+}
+
+// Prüft einen Eintrag aus dem Formular oder den Daten → { eintrag, fehler: [] }
+function pruefeTermin(roh = {}) {
+  const fehler = [];
+  const e = {
+    id: terminText(roh.id, 40),
+    datum: terminText(roh.datum, 10),
+    listenkontakt: { name: terminText(roh.listenkontakt?.name), firma: terminText(roh.listenkontakt?.firma) },
+    kontakt: { name: terminText(roh.kontakt?.name), firma: terminText(roh.kontakt?.firma), rolle: terminText(roh.kontakt?.rolle) },
+    quelle: TERMIN_QUELLEN[roh.quelle] ? roh.quelle : '',
+    referral: typeof roh.referral === 'boolean' ? roh.referral : null,
+    kette: terminText(roh.kette, 400),
+    kanal: TERMIN_KANAELE[roh.kanal] ? roh.kanal : '',
+    anrufId: terminText(roh.anrufId, 40),
+    notiz: String(roh.notiz == null ? '' : roh.notiz).trim().slice(0, 1000),
+  };
+  if (!e.id) fehler.push('ID fehlt.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(e.datum)) fehler.push('Datum der Buchung fehlt.');
+  if (!e.kontakt.name) fehler.push('Tatsächlicher Kontakt: Name fehlt.');
+  if (!e.kontakt.firma) fehler.push('Tatsächlicher Kontakt: Firma fehlt.');
+  if (e.listenkontakt.firma && !e.listenkontakt.name) fehler.push('Listenkontakt: Name fehlt (oder Firma leeren).');
+  if (!e.quelle) fehler.push('Quelle wählen.');
+  if (e.referral === null) fehler.push('Referral in der Kette: Ja oder Nein wählen.');
+  if (e.quelle === 'referral' && e.referral === false) fehler.push('Quelle ist Empfehlung/Referral, dann steht auch ein Referral in der Kette.');
+  if (!e.kette) fehler.push('Kette fehlt.');
+  if (!e.kanal) fehler.push('Buchungskanal wählen.');
+  return { eintrag: e, fehler };
+}
+
+// Alle Termin-Einträge aus mehreren Korrektur-Ständen (später gewinnt, null löscht)
+// plus alte "termineOhneAnruf" ([{ datum, firma, name, notiz }]) als "Herkunft nicht erfasst".
+function terminEintraegeAus(korrekturStaende = [], termineOhneAnruf = []) {
+  const roh = {};
+  for (const k of korrekturStaende) for (const [id, e] of Object.entries((k && k.termine) || {})) roh[id] = e;
+  const liste = [];
+  for (const [id, e] of Object.entries(roh)) {
+    if (!e || typeof e !== 'object') continue;
+    const { eintrag, fehler } = pruefeTermin({ ...e, id });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(eintrag.datum)) continue;      // ohne Datum nicht zuordenbar
+    liste.push({ ...eintrag, erfasst: !fehler.length, fehler });
+  }
+  (termineOhneAnruf || []).forEach((t, i) => {
+    if (!t || !/^\d{4}-\d{2}-\d{2}$/.test(t.datum)) return;
+    liste.push({ id: 'ohne-anruf-' + i, datum: t.datum, listenkontakt: { name: '', firma: '' },
+      kontakt: { name: terminText(t.name), firma: terminText(t.firma), rolle: '' },
+      quelle: '', referral: null, kette: '', kanal: '', anrufId: '', notiz: String(t.notiz || ''), erfasst: false, fehler: [] });
+  });
+  return liste.sort((x, y) => x.datum.localeCompare(y.datum) || x.id.localeCompare(y.id));
+}
+
+// Markiert den Anruf, mit dem eine Kette begann, als "führte zum Termin" (für die
+// Anruf-Kennzahlen: Trichter, Uhrzeit, Nummerntyp, Persona, Firmen).
+function wendeTermineAn(anrufe, eintraege) {
+  const nachAnruf = new Map();
+  for (const e of eintraege || []) if (e.anrufId) nachAnruf.set(e.anrufId, [...(nachAnruf.get(e.anrufId) || []), e]);
+  for (const a of anrufe) {
+    a.terminEintraege = nachAnruf.get(a.engagementId) || [];
+    if (a.terminEintraege.length && a.kategorie !== 'niemand') a.termin = true;
+  }
+  return anrufe;
+}
+
+// Ist der angerufene Kontakt selbst der konvertierte? Bei verknüpftem Eintrag entscheidet dessen tatsächlicher Kontakt.
+function anrufKontaktKonvertiert(a) {
+  if (!a.termin) return false;
+  if (!a.terminEintraege || !a.terminEintraege.length) return true;
+  const ich = personSchluessel(`${a.vorname} ${a.nachname}`);
+  return !!ich && a.terminEintraege.some(e => personSchluessel(e.kontakt.name) === ich);
+}
+
+// Ein Termin je Eintrag, dazu je Anruf mit Termin ohne Eintrag einer ("Herkunft nicht erfasst")
+function terminListeAus(alleAnrufe, eintraege, imZeitraum) {
+  const nachId = new Map(alleAnrufe.filter(a => a.engagementId).map(a => [a.engagementId, a]));
+  const liste = (eintraege || []).filter(e => imZeitraum(e.datum)).map(e => ({ ...e, anruf: nachId.get(e.anrufId) || null }));
+  for (const a of alleAnrufe) {
+    if (!a.termin || (a.terminEintraege && a.terminEintraege.length) || !imZeitraum(a.tag)) continue;
+    const name = `${a.vorname} ${a.nachname}`.trim();
+    liste.push({ id: 'anruf-' + (a.engagementId || kiSchluessel(a)), datum: a.tag, listenkontakt: { name, firma: a.firma || '' },
+      kontakt: { name, firma: a.firma || '', rolle: a.jobtitel || '' }, quelle: '', referral: null, kette: '', kanal: '',
+      anrufId: a.engagementId || '', notiz: '', erfasst: false, fehler: [], anruf: a });
+  }
+  return liste.sort((x, y) => x.datum.localeCompare(y.datum) || x.id.localeCompare(y.id));
+}
+
+function terminKennzahlen(liste) {
+  const erfasst = liste.filter(t => t.erfasst);
+  const zaehl = (werte, feld) => Object.fromEntries(Object.keys(werte).map(k => [k, erfasst.filter(t => t[feld] === k).length]));
+  const referral = erfasst.filter(t => t.referral === true).length;
+  return {
+    gesamt: liste.length,
+    erfasst: erfasst.length,
+    nichtErfasst: liste.length - erfasst.length,
+    referral,
+    referralQuote: erfasst.length ? referral / erfasst.length : null,     // Basis: Termine mit erfasster Herkunft
+    referralKleineStichprobe: erfasst.length < MINDEST_STICHPROBE,
+    ausAnruf: liste.filter(t => t.anruf).length,
+    abweichend: erfasst.filter(t => t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name)).length,
+    quelle: zaehl(TERMIN_QUELLEN, 'quelle'),
+    kanal: zaehl(TERMIN_KANAELE, 'kanal'),
+  };
 }
 
 /* =====================================================================
@@ -925,6 +1068,7 @@ const ADRIC = {
   parseCSV, erkenneTrennzeichen, htmlZuText, klassifiziere, nummernTyp, parseDatum,
   leseAnrufe, zeitraum, heuteIso, tagPlus, auswerten,
   KI_ERGEBNISSE, KI_INTERESSE, KI_STAND, KI_STUFEN, KI_EINWAENDE, ROLLEN, rolleAus, ZIELROLLEN, zielrolleAus, BENCHMARK, groesseAus, notizHash, kiSchluessel, wendeKiAn, wendeKorrekturenAn,
+  TERMIN_QUELLEN, TERMIN_KANAELE, personSchluessel, pruefeTermin, terminEintraegeAus, wendeTermineAn, anrufKontaktKonvertiert, terminListeAus, terminKennzahlen,
   entpackeZip, zipEintragLesen, anrufCsvAus, verschluessle, verschluessleMitSchluessel, entschluessle, b64, unb64, alsAnrufCsv,
 };
 </script>
@@ -1144,7 +1288,38 @@ input[type="number"] { width: 64px; }
 .termin .wer { font-size: 18px; font-weight: 700; margin-top: 6px; }
 .termin .firma { color: var(--ink-2); font-size: 14px; }
 .termin .notiz { font-size: 13px; color: var(--muted); margin-top: 10px; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; }
-.termin .schritt { margin-top: 10px; }
+.termin .schritt { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.termin.offen { border-style: dashed; border-color: color-mix(in oklab, var(--warn) 55%, transparent); }
+.termin .kette { margin-top: 10px; font-family: var(--mono); font-size: 12.5px; line-height: 1.45; color: var(--ink); padding: 8px 10px;
+  border-radius: 10px; background: var(--accent-soft); overflow-wrap: anywhere; }
+.termin-felder { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 10px 0 0; font-size: 13px; }
+.termin-felder dt { color: var(--muted); }
+.termin-felder dd { margin: 0; color: var(--ink-2); overflow-wrap: anywhere; }
+.termin-aktionen { margin-top: 12px; }
+.chip-referral { border-color: var(--good); color: var(--good-ink); font-weight: 600; }
+.chip-warn { border-color: var(--warn); color: var(--warn-ink); }
+.knopf.klein { font-size: 12.5px; padding: 5px 10px; border-radius: 8px; }
+.termin-kopf { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.termin-kpis .w small { font-size: 14px; font-weight: 600; color: var(--ink-2); }
+.termin-verteilung { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+.termin-verteilung > div { font-size: 13px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.termin-verteilung .zwischentitel { width: 100%; margin: 0; }
+@media (max-width: 760px) { .termin-verteilung { grid-template-columns: 1fr; } }
+/* Termin-Formular */
+dialog.termin-dialog { width: min(760px, calc(100vw - 32px)); }
+.formular { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.formular label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--ink-2); font-weight: 600; }
+.formular label small { font-weight: 400; color: var(--muted); }
+.formular .breit, .formular fieldset { grid-column: 1 / -1; }
+.formular fieldset { border: 1px solid var(--line-2); border-radius: 12px; padding: 10px 12px 12px; margin: 0;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.formular legend { font-size: 13px; font-weight: 700; color: var(--ink); padding: 0 6px; }
+.formular legend span { font-weight: 400; color: var(--muted); }
+.formular input, .formular select, .formular textarea { font: inherit; font-size: 14px; font-weight: 400; padding: 7px 9px; border-radius: 8px;
+  border: 1px solid var(--line-2); background: var(--card-solid); color: var(--ink); width: 100%; min-width: 0; }
+.formular textarea { resize: vertical; }
+.termin-knoepfe { display: flex; justify-content: space-between; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+@media (max-width: 640px) { .formular, .formular fieldset { grid-template-columns: 1fr; } }
 
 /* Tabellen */
 .tabelle { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -1365,6 +1540,35 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   <div class="kopfzeile"><h3 id="listeTitel"></h3><button class="knopf leise" type="button" id="listeZu">Schließen</button></div>
   <div class="inhalt" id="listeInhalt"></div>
 </dialog>
+<dialog class="liste termin-dialog" id="terminDialog" aria-labelledby="terminTitel">
+  <form id="terminForm" novalidate>
+    <div class="kopfzeile"><h3 id="terminTitel">Termin erfassen</h3><button class="knopf leise" type="button" data-termin-zu>Schließen</button></div>
+    <div class="inhalt">
+      <p class="notiz-klein">Ein Eintrag ist genau ein Termin, egal wie viele Personen in der Kette stehen. Alles wird von Hand gesetzt, nichts geraten. * = Pflichtfeld.</p>
+      <div class="formular">
+        <label>Gebucht am *<input type="date" name="datum" required></label>
+        <label>Buchungskanal *<select name="kanal" required></select></label>
+        <fieldset><legend>Tatsächlicher Kontakt * <span>· mit ihm wurde gesprochen und gebucht, er zählt als konvertiert</span></legend>
+          <label>Name *<input name="kontaktName" autocomplete="off" required></label>
+          <label>Firma *<input name="kontaktFirma" autocomplete="off" required></label>
+          <label>Rolle<input name="kontaktRolle" autocomplete="off"></label>
+        </fieldset>
+        <fieldset><legend>Listenkontakt <span>· laut Kampagne/Liste; leer, wenn es keinen gab</span></legend>
+          <label>Name<input name="listeName" autocomplete="off"></label>
+          <label>Firma<input name="listeFirma" autocomplete="off"></label>
+        </fieldset>
+        <label>Quelle *<select name="quelle" required></select><small>Wie der allererste Kontakt entstand.</small></label>
+        <label>Referral in der Kette *<select name="referral" required><option value="">– wählen –</option><option value="ja">Ja</option><option value="nein">Nein</option></select><small>Hat jemand an die Person verwiesen?</small></label>
+        <label class="breit">Kette *<input name="kette" autocomplete="off" required placeholder="Cold Call (Kämper) -> Referral -> LinkedIn (Mittelstädt)"><small>Die Stationen als kurzer Text. Weitere Personen stehen nur hier, nicht als eigene Termine.</small></label>
+        <label class="breit">Ausgangsanruf<select name="anrufId"></select><small>Der Anruf, mit dem die Kette begann. Er zählt dann nicht noch einmal als eigener Termin.</small></label>
+        <label class="breit">Notiz<textarea name="notiz" rows="3"></textarea></label>
+      </div>
+      <div id="terminFehler" class="fehler" role="alert" hidden></div>
+      <div class="termin-knoepfe"><span><button type="button" class="knopf leise" data-termin-loeschen hidden>Termin löschen</button></span>
+        <span><button type="button" class="knopf leise" data-termin-zu>Abbrechen</button> <button type="submit" class="knopf">Übernehmen</button></span></div>
+    </div>
+  </form>
+</dialog>
 <div class="tip" id="tip" hidden></div>
 
 <!-- =====================================================================
@@ -1388,7 +1592,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   const gespeicherterVersatz = parseFloat(speicher.get('adric.versatz.v2'));
   const zustand = {
-    text: null, dateiname: '', ki: null, online: null, termineOhneAnruf: [], korrekturen: null, korrekturNeu: null,
+    text: null, dateiname: '', ki: null, online: null, termineOhneAnruf: [], termine: [], korrekturen: null, korrekturNeu: null,
     versatz: Number.isFinite(gespeicherterVersatz) ? gespeicherterVersatz : STANDARD_STUNDENVERSATZ,
     art: 'woche', von: null, bis: null, daten: null,
   };
@@ -1495,10 +1699,11 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     let t = `<strong>${zahl(g.anrufe)}</strong> Anrufe an <strong>${zahl(r.telefontage)}</strong> Telefontag${r.telefontage === 1 ? '' : 'en'} (Ø ${proTag}), ` +
       `<strong>${zahl(g.gespraech)}</strong> echte Gespräche (${prozent(g.quote)}${g.kleineStichprobe ? ', Stichprobe klein' : ''}), ${zahl(g.abgewimmelt)} abgewimmelt, ${zahl(g.niemand)} ohne Kontakt` +
       (g.unklar ? `, ${zahl(g.unklar)} unklar` : '') + ` und <strong>${zahl(termineGesamt)}</strong> Termin${termineGesamt === 1 ? '' : 'e'}. ` +
-      `${zahl(kl.length)} Kontakte bei ${zahl(r.firmen)} Firmen angerufen, ${zahl(mitG)} davon gesprochen.`;
+      `${zahl(kl.length)} Kontakte bei ${zahl(r.firmen)} Firmen angerufen, ${zahl(mitG)} davon gesprochen.` +
+      (r.terminKpi.referral ? ` <strong>${zahl(r.terminKpi.referral)}</strong> Termin${r.terminKpi.referral === 1 ? '' : 'e'} mit Referral in der Kette (${prozent(r.terminKpi.referralQuote)} der erfassten${r.terminKpi.referralKleineStichprobe ? ', Stichprobe klein' : ''}).` : '');
     if (v && v.gesamt.anrufe) {
       const d = (a, b) => (a - b > 0 ? '+' : a - b < 0 ? '−' : '±') + Math.abs(a - b);
-      t += ` Gegenüber ${esc(vName)}: Anrufe ${d(g.anrufe, v.gesamt.anrufe)}, Gespräche ${d(g.gespraech, v.gesamt.gespraech)}, Termine ${d(termineGesamt, v.gesamt.termin + v.termineOhneAnruf.length)}.`;
+      t += ` Gegenüber ${esc(vName)}: Anrufe ${d(g.anrufe, v.gesamt.anrufe)}, Gespräche ${d(g.gespraech, v.gesamt.gespraech)}, Termine ${d(termineGesamt, v.terminListe.length)}.`;
     }
     const niemand = Object.entries(r.details).filter(([k]) => gruppeErgebnis(k) === 'niemand' && KI_ERGEBNISSE[k]).sort((a, b) => b[1] - a[1])[0];
     if (niemand && g.anrufe) t += ` Häufigster Grund, niemanden zu sprechen: <em>${esc(labelErgebnis(niemand[0]))}</em> (${prozent(niemand[1] / g.anrufe)} der Anrufe).`;
@@ -1552,6 +1757,54 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   }
 
   /* ---------- Board zeichnen ---------- */
+  /* ---------- Termine mit Quelle und Kette ---------- */
+  const kettePfeile = text => esc(text).replace(/\s*(-&gt;|→|=&gt;)\s*/g, ' → ');
+  const personText = p => p && p.name ? esc(p.name) + (p.firma ? ` <span class="klein-text">(${esc(p.firma)})</span>` : '') : '–';
+  function terminKarte(t) {
+    const a = t.anruf;
+    const anders = t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name);
+    const knopf = String(t.id).startsWith('ohne-anruf-') ? ''
+      : t.erfasst || t.id.startsWith('t-') || (t.fehler && t.fehler.length) ? `<button class="knopf leise klein" type="button" data-termin-bearbeiten="${esc(t.id)}">Bearbeiten</button>`
+      : `<button class="knopf leise klein" type="button" data-termin-neu data-anruf="${esc(t.anrufId)}">Herkunft erfassen</button>`;
+    return `<article class="termin${t.erfasst ? '' : ' offen'}">
+      <div class="wann">${tagKurz(t.datum)}${t.kanal ? ` · gebucht per ${esc(TERMIN_KANAELE[t.kanal])}` : ''}</div>
+      <div class="wer">${esc(t.kontakt.name || '–')}</div>
+      <div class="firma">${esc(t.kontakt.firma || '–')}${t.kontakt.rolle ? ' · ' + esc(t.kontakt.rolle) : ''}</div>
+      <div class="schritt">${t.erfasst
+        ? `<span class="chip">Quelle: ${esc(TERMIN_QUELLEN[t.quelle])}</span>${t.referral ? '<span class="chip chip-referral">Referral in der Kette</span>' : ''}`
+        : '<span class="chip chip-warn">Herkunft nicht erfasst</span>'}</div>
+      ${t.kette ? `<div class="kette">${kettePfeile(t.kette)}</div>` : ''}
+      <dl class="termin-felder">
+        <dt>Tatsächlich</dt><dd>${personText(t.kontakt)}</dd>
+        <dt>Listenkontakt</dt><dd>${personText(t.listenkontakt)}${anders ? ' <span class="chip chip-warn">weicht ab</span>' : ''}</dd>
+        <dt>Ausgangsanruf</dt><dd>${a ? `${tagKurz(a.tag)} ${uhrzeit(a.zeit)} · ${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}` : t.anrufId ? `ID ${esc(t.anrufId)} (nicht in den Daten)` : '–'}</dd>
+      </dl>
+      ${t.notiz ? `<div class="notiz">${esc(t.notiz)}</div>` : !t.erfasst && a ? `<div class="notiz">${esc(a.notiz)}</div>` : ''}
+      ${t.fehler && t.fehler.length ? `<p class="notiz-klein">⚠ Unvollständig: ${esc(t.fehler.join(' '))}</p>` : ''}
+      ${knopf ? `<div class="termin-aktionen no-print">${knopf}</div>` : ''}
+    </article>`;
+  }
+  function terminBereich(r) {
+    const tk = r.terminKpi;
+    const verteilung = (titel, werte, zahlen) => `<div><div class="zwischentitel">${titel}</div>${Object.entries(werte)
+      .map(([k, l]) => `<span class="chip">${esc(l)} <strong class="num" style="margin-left:5px">${zahl(zahlen[k])}</strong></span>`).join('')}</div>`;
+    return `<div class="termin-kopf"><span class="notiz-klein" style="margin:0">Jeder Termin zählt genau einmal, egal wie viele Personen in der Kette stehen.</span>
+        <button class="knopf klein no-print" type="button" data-termin-neu>+ Termin erfassen</button></div>
+      <div class="mini-kpis termin-kpis">
+        <div data-liste="terminliste" title="Liste anzeigen"><div class="w">${zahl(tk.gesamt)}</div><div class="t">Termine</div></div>
+        <div data-liste="terminliste:referral" title="Liste anzeigen"><div class="w">${zahl(tk.referral)} <small class="${tk.referralKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(tk.referralQuote)}</small></div>
+          <div class="t">mit Referral in der Kette${tk.erfasst ? ` · Anteil an ${zahl(tk.erfasst)} erfassten` : ''}</div>
+          ${tk.erfasst && tk.referralKleineStichprobe ? kleinHinweis(tk.erfasst) : ''}</div>
+        <div data-liste="terminliste:abweichend" title="Liste anzeigen"><div class="w">${zahl(tk.abweichend)}</div><div class="t">Listenkontakt ≠ tatsächlicher Kontakt</div></div>
+        <div data-liste="terminliste:offen" title="Liste anzeigen"><div class="w">${zahl(tk.nichtErfasst)}</div><div class="t">Herkunft nicht erfasst</div></div>
+      </div>
+      <div class="termin-verteilung">${verteilung('Quelle (erster Kontakt)', TERMIN_QUELLEN, tk.quelle)}${verteilung('Buchungskanal', TERMIN_KANAELE, tk.kanal)}</div>
+      ${r.terminListe.length ? `<div class="termine">${r.terminListe.slice().reverse().map(terminKarte).join('')}</div>` : '<p class="notiz-klein">Keine gebuchten Termine im Zeitraum.</p>'}
+      <p class="notiz-klein">Referral ist der ertragreichste Kanal (Branche: ${esc(BENCHMARK.referral)}). Konvertiert zählt immer der <strong>tatsächliche Kontakt</strong> (Pipeline, Kontakte);
+        der Listenkontakt steht nur zur Info da. Anruf-Kennzahlen (Trichter, Uhrzeit, Nummerntyp, Persona, Firmen) rechnen den Termin dem Ausgangsanruf zu.
+        Termine ohne erfasste Herkunft zählen mit, aber nicht im Referral-Anteil.</p>`;
+  }
+
   function zeichne() {
     const d = zustand.daten;
     $('#start').hidden = !!d || !$('#sperre').hidden;
@@ -1570,9 +1823,10 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     $('#versatz').value = zustand.versatz;
     $('#dateiname').textContent = zustand.dateiname;
 
-    const r = auswerten(d.anrufe, zustand.von, zustand.bis, zustand.termineOhneAnruf);
+    const r = auswerten(d.anrufe, zustand.von, zustand.bis, zustand.termine);
     const g = r.gesamt;
-    const termineGesamt = g.termin + r.termineOhneAnruf.length;
+    const termineGesamt = r.terminListe.length;
+    const tk = r.terminKpi;
     letzteAuswertung = r;
     $('#zeitraumText').textContent = zeitraumBeschriftung(zustand.von, zustand.bis);
 
@@ -1580,7 +1834,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     let v = null, vName = '';
     if (zustand.von && zustand.bis) {
       const laenge = tageZwischen(zustand.von, zustand.bis) + 1;
-      v = auswerten(d.anrufe, tagPlus(zustand.von, -laenge), tagPlus(zustand.von, -1), zustand.termineOhneAnruf);
+      v = auswerten(d.anrufe, tagPlus(zustand.von, -laenge), tagPlus(zustand.von, -1), zustand.termine);
       vName = laenge === 7 ? 'Vorwoche' : 'Vorperiode';
     }
 
@@ -1598,12 +1852,13 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <div class="zusatz"><span class="${g.kleineStichprobe ? 'quote-unsicher' : ''}">${anteil(g.gespraech)} der Anrufe</span>
           ${g.anrufe && g.kleineStichprobe ? kleinHinweis(g.anrufe) : ''}${deltaHtml(g.gespraech, v?.gesamt.gespraech, vName)}</div>
         <div class="bench">Branche: Gesprächsquote ${BENCHMARK.gespraechsquote}</div></div>
-      <div class="card kpi gross auftritt" data-liste="termine" tabindex="0" role="button"><div class="titel">Termine</div>
+      <div class="card kpi gross auftritt" data-liste="terminliste" tabindex="0" role="button"><div class="titel">Termine</div>
         <div class="wert" data-ziel="${termineGesamt}">0</div>
         <div class="zusatz"><span class="${g.terminKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(terminQuoteGesamt)} der echten Gespräche</span>
           ${g.gespraech && g.terminKleineStichprobe ? kleinHinweis(g.gespraech) : ''}
           ${r.termineOhneAnruf.length ? `<span>inkl. ${zahl(r.termineOhneAnruf.length)} ohne Anruf</span>` : ''}
-          ${deltaHtml(termineGesamt, v ? v.gesamt.termin + v.termineOhneAnruf.length : null, vName)}</div>
+          ${tk.referral ? `<span>${zahl(tk.referral)} mit Referral</span>` : ''}
+          ${deltaHtml(termineGesamt, v ? v.terminListe.length : null, vName)}</div>
         <div class="bench">Branche: Terminquote ${BENCHMARK.terminquote}</div></div>
       <div class="card kpi auftritt" data-liste="stufe:abgewimmelt" tabindex="0" role="button"><div class="titel">Abgewimmelt</div>
         <div class="wert" data-ziel="${g.abgewimmelt}">0</div><div class="zusatz">${anteil(g.abgewimmelt)} der Anrufe</div></div>
@@ -1685,24 +1940,9 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     <div class="heat-legende"><span>Gesprächsquote</span><span>0 %</span><span class="verlauf"></span><span>100 %</span>
       <span class="muster"></span><span>schraffiert = weniger als ${MINDEST_STICHPROBE} Anrufe, Quote nicht belastbar</span></div>`;
 
-    // Termine
-    $('#termineZusatz').textContent = `${zahl(termineGesamt)} im Zeitraum` + (r.termineOhneAnruf.length ? `, davon ${zahl(r.termineOhneAnruf.length)} ohne Anruf` : '');
-    const karteOhneAnruf = t => `
-      <article class="termin">
-        <div class="wann">${tagKurz(t.datum)} · <span class="chip">ohne Anruf</span></div>
-        <div class="wer">${esc(t.name || '–')}</div>
-        <div class="firma">${esc(t.firma || '–')}</div>
-        ${t.notiz ? `<div class="notiz">${esc(t.notiz)}</div>` : ''}
-      </article>`;
-    $('#termine').innerHTML = termineGesamt ? `<div class="termine">${r.termineOhneAnruf.map(karteOhneAnruf).join('')}${r.termine.map(a => `
-      <article class="termin">
-        <div class="wann">${tagKurz(a.tag)} · ${uhrzeit(a.zeit)}</div>
-        <div class="wer">${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</div>
-        <div class="firma">${esc(a.firma || '–')}</div>
-        ${a.schritt ? `<div class="schritt"><span class="chip">→ ${esc(a.schritt)}</span></div>` : ''}
-        ${a.manuell ? '<div class="schritt"><span class="chip">von Hand bestätigt</span></div>' : ''}
-        <div class="notiz">${esc(a.notiz)}</div>
-      </article>`).join('')}</div>` : '<p class="notiz-klein">Keine gebuchten Termine im Zeitraum.</p>';
+    // Termine: je Kette genau einer
+    $('#termineZusatz').textContent = `${zahl(termineGesamt)} im Zeitraum, nach Buchungsdatum` + (r.termineOhneAnruf.length ? `, davon ${zahl(r.termineOhneAnruf.length)} ohne Anruf` : '');
+    $('#termine').innerHTML = terminBereich(r);
 
     // Reihen
     $('#proTag').innerHTML = reihen(r.proTag.map(t => ({ label: tagKurz(t.tag), t })));
@@ -1729,7 +1969,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         Weiterleitung an neuen Kontakt, E-Mail oder Unterlagen raus, Rückruf vereinbart. Falsch eingeordnet? In <code>.lokal/korrekturen.json</code> unter „stand“ korrigieren.</p>`;
 
     // Wochen-Summary (gewählter Zeitraum) und Erkenntnisse (alle Daten, robuster)
-    const alle = (zustand.von || zustand.bis) ? auswerten(d.anrufe, null, null, zustand.termineOhneAnruf) : r;
+    const alle = (zustand.von || zustand.bis) ? auswerten(d.anrufe, null, null, zustand.termine) : r;
     $('#summaryZusatz').textContent = zeitraumBeschriftung(zustand.von, zustand.bis);
     $('#summary').innerHTML = `<p class="summary-text">${summaryText(r, v, vName, termineGesamt)}</p>
       <div class="zwischentitel">Was man daraus lernen kann <span style="text-transform:none;letter-spacing:0;font-weight:400">· aus allen ${zahl(alle.gesamt.anrufe)} Anrufen</span></div>
@@ -1830,7 +2070,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   const STUFE_ZU_KI = { gespraech: 'echtes_gespraech', abgewimmelt: 'abgewimmelt', niemand: 'kein_kontakt', unklar: 'unklar' };
   const kannKorrigieren = () => !!(zustand.online && zustand.schluessel && speicher.get(TOKEN_SCHLUESSEL));
   const anrufZeile = a => `<tr>
-    <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? '<br><span class="termin-marke">Termin</span>' : ''}</td>
+    <td class="zeit">${tagKurz(a.tag)} ${uhrzeit(a.zeit)}${a.termin ? `<br><span class="termin-marke">${anrufKontaktKonvertiert(a) ? 'Termin' : 'Termin mit ' + esc(a.terminEintraege[0].kontakt.name)}</span>` : ''}</td>
     <td><strong>${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}</strong><div class="klein-text">${esc(a.firma || '–')}</div>
       ${a.jobtitel ? `<div class="klein-text">${esc(a.jobtitel.slice(0, 70))} · ${esc(zielrolleAus(a.jobtitel))}</div>` : ''}
       <div class="klein-text">${esc(a.telefon || 'keine Nummer')} · ${esc(NUMMERNTYPEN[a.nummerTyp])}</div>
@@ -1866,6 +2106,26 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
           <td class="num">${zahl(k.versuche)}</td><td class="num">${offen ? '–' : zahl(k.bisGespraech) + '. Versuch'}</td>
           <td class="neben klein-text">${tagKurz(k.letzter.tag)} · ${esc(labelErgebnis(k.letzter.detail || k.letzter.kategorie))}</td></tr>`).join('')}</tbody></table>`
         : '<p class="notiz-klein">Keine Einträge.</p>';
+    } else if (schluessel.startsWith('terminliste')) {
+      const art = schluessel.split(':')[1];
+      const auswahl = {
+        referral: ['mit Referral in der Kette', t => t.erfasst && t.referral === true],
+        abweichend: ['Listenkontakt ≠ tatsächlicher Kontakt', t => t.erfasst && t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name)],
+        offen: ['Herkunft nicht erfasst', t => !t.erfasst],
+      }[art] || ['', () => true];
+      const liste = r.terminListe.filter(auswahl[1]).reverse();
+      titel = `${zahl(liste.length)} Termin${liste.length === 1 ? '' : 'e'}${auswahl[0] ? ' ' + auswahl[0] : ''}`;
+      html = liste.length ? `<div class="termine">${liste.map(terminKarte).join('')}</div>` : '<p class="notiz-klein">Keine Einträge.</p>';
+    } else if (schluessel === 'pipeline:termin') {
+      const liste = r.pipeline.termin;
+      titel = `Termin · ${zahl(liste.length)} konvertierte Kontakte`;
+      html = `<table class="tabelle firmen"><thead><tr><th>Tatsächlicher Kontakt</th><th>Kette</th><th class="neben">Ausgangsanruf</th></tr></thead>
+        <tbody>${liste.map(e => {
+          const t = e.termin || (e.anruf && r.terminListe.find(x => x.anruf === e.anruf));
+          return `<tr><td><strong>${esc(e.name)}</strong><div class="klein-text">${esc(e.firma || '–')}</div></td>
+            <td class="klein-text">${t && t.kette ? kettePfeile(t.kette) : 'Herkunft nicht erfasst'}</td>
+            <td class="neben klein-text">${e.anruf ? `${tagKurz(e.anruf.tag)} · ${esc(`${e.anruf.vorname} ${e.anruf.nachname}`.trim())}` : '–'}</td></tr>`;
+        }).join('')}</tbody></table>`;
     } else if (schluessel === 'kontakte') {
       const map = new Map();
       for (const a of r.anrufe) {
@@ -1873,7 +2133,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         const k = a.kontaktId || `${name.toLowerCase()}|${a.telefon}`;
         if (!a.kontaktId && !name && !a.telefon) continue;
         const e = map.get(k) || { name: name || '–', firma: a.firma, anrufe: 0, gespraech: 0, termin: 0, letzte: a };
-        e.anrufe++; if (a.kategorie === 'gespraech') e.gespraech++; if (a.termin) e.termin++;
+        e.anrufe++; if (a.kategorie === 'gespraech') e.gespraech++; if (anrufKontaktKonvertiert(a)) e.termin++;
         if (a.zeit > e.letzte.zeit) e.letzte = a;
         map.set(k, e);
       }
@@ -1889,7 +2149,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         gespraeche: [`${zahl(r.gespraeche.length)} Gespräche`, r.gespraeche],
         erreicht: ['Kontakt hergestellt', r.anrufe.filter(a => a.kategorie === 'gespraech' || a.kategorie === 'abgewimmelt')],
         interesse: ['Gespräche mit Interesse oder Termin', r.gespraeche.filter(a => a.stand === 'interesse' || a.termin)],
-        termine: [`Termine aus Anrufen`, r.termine],
+        termine: [`Anrufe, die zu einem Termin führten`, r.termine],
       }[schluessel];
       if (filter) [titel, html] = [filter[0], anrufTabelle(filter[1])];
       else if (schluessel.startsWith('stufe:')) {
@@ -1915,7 +2175,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         [titel, html] = [`${labelErgebnis(k)} · ${zahl(liste.length)}`, anrufTabelle(liste)];
       } else return;
       if (schluessel === 'termine' && r.termineOhneAnruf.length) {
-        html += `<p class="notiz-klein">Dazu ${zahl(r.termineOhneAnruf.length)} Termin(e) ohne Anruf: ${r.termineOhneAnruf.map(t => esc(`${t.name} (${t.firma})`)).join(', ')}.</p>`;
+        html += `<p class="notiz-klein">Dazu ${zahl(r.termineOhneAnruf.length)} Termin(e) ohne Anruf: ${r.termineOhneAnruf.map(t => esc(`${t.kontakt.name} (${t.kontakt.firma})`)).join(', ')}.</p>`;
       }
     }
     $('#listeTitel').textContent = `${titel} · ${$('#zeitraumText').textContent}`;
@@ -1947,6 +2207,8 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       wendeKiAn(daten.anrufe, zustand.ki);
       wendeKorrekturenAn(daten.anrufe, zustand.korrekturen);
       wendeKorrekturenAn(daten.anrufe, zustand.korrekturNeu);
+      zustand.termine = terminEintraegeAus([zustand.korrekturen, zustand.korrekturNeu], zustand.termineOhneAnruf);
+      wendeTermineAn(daten.anrufe, zustand.termine);
       zustand.daten = daten;
       zeigeFehler('');
     } catch (e) {
@@ -2080,6 +2342,91 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
     if (e.target.closest('[data-korrektur-verwerfen]')) { zustand.korrekturNeu = null; zeigeKorrekturLeiste(); rechne(); }
   });
 
+  /* ---------- Termin erfassen und bearbeiten ---------- */
+  const terminForm = $('#terminForm');
+  const optionen = (werte, gewaehlt) => `<option value="">– wählen –</option>` +
+    Object.entries(werte).map(([k, l]) => `<option value="${k}"${k === gewaehlt ? ' selected' : ''}>${esc(l)}</option>`).join('');
+  function oeffneTerminForm(eintrag) {
+    const e = eintrag || {};
+    const el = terminForm.elements;
+    terminForm.dataset.id = e.id || 't-' + Date.now().toString(36);
+    terminForm.dataset.neu = eintrag && eintrag.id ? '' : '1';
+    $('#terminTitel').textContent = eintrag && eintrag.id ? 'Termin bearbeiten' : 'Termin erfassen';
+    el.datum.value = e.datum || '';
+    el.kanal.innerHTML = optionen(TERMIN_KANAELE, e.kanal);
+    el.quelle.innerHTML = optionen(TERMIN_QUELLEN, e.quelle);
+    el.referral.value = e.referral === true ? 'ja' : e.referral === false ? 'nein' : '';
+    el.kontaktName.value = e.kontakt?.name || ''; el.kontaktFirma.value = e.kontakt?.firma || ''; el.kontaktRolle.value = e.kontakt?.rolle || '';
+    el.listeName.value = e.listenkontakt?.name || ''; el.listeFirma.value = e.listenkontakt?.firma || '';
+    el.kette.value = e.kette || ''; el.notiz.value = e.notiz || '';
+    // Ausgangsanruf: alle Anrufe mit Kontakt, neueste zuerst; schon verknüpfte sind markiert
+    const anrufe = (zustand.daten?.anrufe || []).filter(a => a.engagementId && (a.kategorie !== 'niemand' || a.engagementId === e.anrufId)).slice().reverse();
+    el.anrufId.innerHTML = '<option value="">– kein Anruf (z. B. LinkedIn, Inbound) –</option>' + anrufe.map(a => {
+      const belegt = (a.terminEintraege || []).some(x => x.id !== terminForm.dataset.id);
+      return `<option value="${esc(a.engagementId)}"${a.engagementId === e.anrufId ? ' selected' : ''}>${esc(`${datumLang(a.tag)} · ${`${a.vorname} ${a.nachname}`.trim() || '–'} · ${a.firma || '–'} · ${KATEGORIEN[a.kategorie]}${belegt ? ' · schon mit Termin verknüpft' : ''}`)}</option>`;
+    }).join('');
+    if (e.anrufId && el.anrufId.value !== e.anrufId) el.anrufId.insertAdjacentHTML('beforeend', `<option value="${esc(e.anrufId)}" selected>ID ${esc(e.anrufId)} (nicht in den Daten)</option>`);
+    terminForm.querySelector('[data-termin-loeschen]').hidden = !(eintrag && eintrag.id);
+    $('#terminFehler').hidden = true;
+    $('#terminDialog').showModal();
+    el.datum.focus();
+  }
+  function terminAusForm() {
+    const v = n => terminForm.elements[n].value;
+    return {
+      id: terminForm.dataset.id, datum: v('datum'), kanal: v('kanal'), quelle: v('quelle'),
+      referral: v('referral') === 'ja' ? true : v('referral') === 'nein' ? false : null,
+      kontakt: { name: v('kontaktName'), firma: v('kontaktFirma'), rolle: v('kontaktRolle') },
+      listenkontakt: { name: v('listeName'), firma: v('listeFirma') },
+      kette: v('kette'), anrufId: v('anrufId'), notiz: v('notiz'),
+    };
+  }
+  function setzeTermin(id, eintrag) {
+    zustand.korrekturNeu = zustand.korrekturNeu || {};
+    const neu = (zustand.korrekturNeu.termine = zustand.korrekturNeu.termine || {});
+    const gespeichert = zustand.korrekturen?.termine && id in zustand.korrekturen.termine;
+    if (eintrag) neu[id] = eintrag;
+    else if (gespeichert) neu[id] = null;          // gespeicherten Termin löschen
+    else delete neu[id];                           // nur lokal angelegt: einfach verwerfen
+    if (!Object.keys(neu).length) delete zustand.korrekturNeu.termine;
+    if (!Object.keys(zustand.korrekturNeu).length) zustand.korrekturNeu = null;
+    rechne();
+    zeigeKorrekturLeiste();
+  }
+  terminForm.addEventListener('submit', e => {
+    e.preventDefault();
+    const { eintrag, fehler } = pruefeTermin(terminAusForm());
+    const doppelt = eintrag.anrufId && zustand.termine.find(t => t.anrufId === eintrag.anrufId && t.id !== eintrag.id);
+    if (doppelt) fehler.push(`Der Ausgangsanruf gehört schon zum Termin mit ${doppelt.kontakt.name}. Ein Anruf, ein Termin – bitte dort ergänzen.`);
+    if (fehler.length) {
+      $('#terminFehler').innerHTML = fehler.map(esc).join('<br>');
+      $('#terminFehler').hidden = false;
+      return;
+    }
+    $('#terminDialog').close();
+    setzeTermin(eintrag.id, eintrag);
+  });
+  document.addEventListener('click', e => {
+    const neu = e.target.closest('[data-termin-neu]');
+    if (neu) { if ($('#liste').open) $('#liste').close(); oeffneTerminForm(neu.dataset.anruf ? { anrufId: neu.dataset.anruf } : null); return; }
+    const bearb = e.target.closest('[data-termin-bearbeiten]');
+    if (bearb) {
+      const t = zustand.termine.find(x => x.id === bearb.dataset.terminBearbeiten);
+      if ($('#liste').open) $('#liste').close();
+      if (t) oeffneTerminForm(t);
+      return;
+    }
+    if (e.target.closest('[data-termin-zu]')) { $('#terminDialog').close(); return; }
+    if (e.target.closest('[data-termin-loeschen]')) {
+      const id = terminForm.dataset.id;
+      const t = zustand.termine.find(x => x.id === id);
+      if (!confirm(`Termin mit ${t ? t.kontakt.name : 'diesem Kontakt'} löschen? Wirksam erst nach „Für alle speichern“.`)) return;
+      $('#terminDialog').close();
+      setzeTermin(id, null);
+    }
+  });
+  $('#terminDialog').addEventListener('click', e => { if (e.target === $('#terminDialog')) $('#terminDialog').close(); });
+
   async function speichereUpload(text, quelle) {
     if (uploadLaeuft) { zeigeStatus('fehler', 'Es läuft schon ein Upload. Bitte warten.'); return; }
     uploadLaeuft = true;
@@ -2192,7 +2539,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
 
   $('#sperren').addEventListener('click', () => {
     speicher.weg(MERK_SCHLUESSEL);
-    Object.assign(zustand, { text: null, ki: null, online: null, daten: null, dateiname: '', termineOhneAnruf: [], korrekturen: null, schluessel: null });
+    Object.assign(zustand, { text: null, ki: null, online: null, daten: null, dateiname: '', termineOhneAnruf: [], termine: [], korrekturen: null, korrekturNeu: null, schluessel: null });
     $('#uploadStatus').hidden = true;
     $('#sperre').hidden = false;
     zeichne();

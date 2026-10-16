@@ -31,7 +31,7 @@ git add data && git commit -m "Daten aktualisiert" && git push
 
 - **KI:** Nur neue oder geänderte Notizen gehen an OpenAI (`gpt-5-mini`, einstellbar über `OPENAI_MODEL`). Bekannte Notizen kommen aus `.lokal/ki-cache.json`. Der Key wird aus `~/adric job scraping/.env` gelesen und landet nie im Repo oder auf der Website.
 - **Passwort:** wird beim ersten Lauf gesetzt (mindestens 12 Zeichen) und liegt im macOS-Schlüsselbund. Neues Passwort setzen: `--neues-passwort`.
-- **Korrekturen von Hand:** in `.lokal/korrekturen.json`. Dort lassen sich Anrufe als Termin markieren, wenn der Termin erst danach per E-Mail zustande kam, und fehlende Firmennamen nachtragen. Termine ganz ohne Anruf gehören in `.lokal/termine-ohne-anruf.json` (`[{ "datum": "JJJJ-MM-TT", "firma": "…", "name": "…" }]`).
+- **Korrekturen von Hand:** in `.lokal/korrekturen.json`. Dort lassen sich Anrufe als Termin markieren, wenn der Termin erst danach per E-Mail zustande kam, und fehlende Firmennamen nachtragen. Termine mit Quelle und Kette (auch ganz ohne Anruf) werden im Board erfasst, siehe „Termine: Quelle, Kette, Personen“. Die alte Datei `.lokal/termine-ohne-anruf.json` wird noch gelesen, solche Termine erscheinen als „Herkunft nicht erfasst“.
 - `.lokal/` steht in `.gitignore` und wird nie hochgeladen.
 
 ## Benutzen
@@ -62,6 +62,21 @@ Jede Notiz wird anhand von Stichwörtern einer von drei Kategorien zugeordnet: *
 ### Termin gebucht
 
 Ein Gespräch zählt zusätzlich als **Termin gebucht**, wenn die Notiz ein Wort aus `WOERTER_TERMIN_GEBUCHT` enthält, etwa „Termin vereinbart“, „Termin ausgemacht“ oder „call gebucht“, und keines aus `WOERTER_KEIN_TERMIN`, etwa „keinen Termin“, „nicht ausmachen“ oder „schon vereinbart“. In den Listen steht `…` für bis zu 40 Zeichen im selben Satz, „Termin am Freitag 10 Uhr vereinbart“ zählt also auch. Termine erscheinen als Kennzahl (mit Anteil an den Gesprächen), als Spalte pro Tag, Wochentag, Stunde und Firma und als eigene Liste „Gebuchte Termine“.
+
+### Termine: Quelle, Kette, Personen
+
+Termine entstehen oft über Umwege. Deshalb gibt es im Bereich **Gebuchte Termine** den Knopf **+ Termin erfassen**. Alle Felder werden von Hand gesetzt, das Board rät nichts:
+
+- **Tatsächlicher Kontakt** (Pflicht): mit ihm wurde gesprochen und gebucht. Er zählt als konvertierter Kontakt (Pipeline, Kontakte).
+- **Listenkontakt** (optional): wer in Kampagne/Liste zugewiesen war. Weicht er ab, steht „weicht ab“ an der Karte.
+- **Quelle**: wie der allererste Kontakt entstand (Cold Call, LinkedIn, Inbound, Empfehlung/Referral, Bestandskontakt).
+- **Referral in der Kette** (Ja/Nein) und **Kette** als kurzer Text, z. B. `Cold Call (Kämper) -> Referral -> LinkedIn (Mittelstädt)`.
+- **Buchungskanal**: Telefon, LinkedIn oder E-Mail.
+- **Ausgangsanruf** (optional): der Anruf, mit dem die Kette begann.
+
+Zählregeln: Jeder Eintrag ist **genau ein Termin**, egal wie viele Personen in der Kette stehen. Ist ein Anruf, den KI oder Korrektur schon als Termin markiert hat, mit einem Eintrag verknüpft, zählt nur der Eintrag. Ein Anruf kann nur mit einem Termin verknüpft werden. Anruf-Termine ohne Eintrag zählen weiter mit, aber als „Herkunft nicht erfasst“ (Knopf „Herkunft erfassen“). Gezählt wird nach Buchungsdatum. Anruf-Kennzahlen (Trichter, Uhrzeit, Nummerntyp, Persona, Firmen) rechnen den Termin dem Ausgangsanruf zu. „Mit Referral in der Kette“ zeigt Anzahl und Anteil an den Terminen mit erfasster Herkunft.
+
+Gespeichert wird wie jede Korrektur über **Für alle speichern** (`korrekturen.termine` in den verschlüsselten Daten).
 
 ### Kleine Stichproben
 
