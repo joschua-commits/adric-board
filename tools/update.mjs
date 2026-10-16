@@ -345,7 +345,7 @@ console.log(`KI-Einordnung für ${anrufe.filter(a => a.ki).length}/${anrufe.leng
 const g = r.gesamt;
 console.log(`Ergebnis: ${g.anrufe} Anrufe · ${g.gespraech} echte Gespräche · ${g.abgewimmelt} abgewimmelt · ${g.niemand} kein Kontakt · ${g.unklar} UNKLAR · ${r.terminListe.length} Termine`);
 const tk = r.terminKpi;
-console.log(`Termine: ${tk.erfasst} mit erfasster Herkunft · ${tk.referral} mit Referral in der Kette · ${tk.abweichend} Listenkontakt ≠ tatsächlicher Kontakt · ${tk.nichtErfasst} Herkunft nicht erfasst`);
+console.log(`Termine: ${tk.erfasst} mit erfasster Herkunft · ${tk.referral} mit Referral in der Kette · ${tk.abweichend} Listenkontakt ≠ tatsächlicher Kontakt · ${tk.direkt} direkt gebucht ohne Kette (keine Angaben)${tk.nichtErfasst ? ` · ${tk.nichtErfasst} ohne Herkunft` : ''}`);
 
 /* ---------- 3. Verschlüsseln ---------- */
 const inhalt = { version: 2, erstellt: new Date().toISOString(), quelle, modell, stat, csv: csvNeu, ki, termineOhneAnruf, korrekturen };

@@ -74,7 +74,7 @@ Termine entstehen oft über Umwege. Deshalb gibt es im Bereich **Gebuchte Termin
 - **Buchungskanal**: Telefon, LinkedIn oder E-Mail.
 - **Ausgangsanruf** (optional): der Anruf, mit dem die Kette begann.
 
-Zählregeln: Jeder Eintrag ist **genau ein Termin**, egal wie viele Personen in der Kette stehen. Ist ein Anruf, den KI oder Korrektur schon als Termin markiert hat, mit einem Eintrag verknüpft, zählt nur der Eintrag. Ein Anruf kann nur mit einem Termin verknüpft werden. Anruf-Termine ohne Eintrag zählen weiter mit, aber als „Herkunft nicht erfasst“ (Knopf „Herkunft erfassen“). Gezählt wird nach Buchungsdatum. Anruf-Kennzahlen (Trichter, Uhrzeit, Nummerntyp, Persona, Firmen) rechnen den Termin dem Ausgangsanruf zu. „Mit Referral in der Kette“ zeigt Anzahl und Anteil an den Terminen mit erfasster Herkunft.
+Zählregeln: Jeder Eintrag ist **genau ein Termin**, egal wie viele Personen in der Kette stehen. Ist ein Anruf, den KI oder Korrektur schon als Termin markiert hat, mit einem Eintrag verknüpft, zählt nur der Eintrag. Ein Anruf kann nur mit einem Termin verknüpft werden. Anruf-Termine ohne Eintrag gelten als **direkt gebucht**: Cold Call, kein Referral, keine Kette, Listenkontakt = angerufene Person, gebucht am Telefon am Tag des Anrufs. Weicht es ab, über „Abweichung erfassen“ eintragen. Gezählt wird nach Buchungsdatum. Anruf-Kennzahlen (Trichter, Uhrzeit, Nummerntyp, Persona, Firmen) rechnen den Termin dem Ausgangsanruf zu. „Mit Referral in der Kette“ zeigt Anzahl und Anteil an allen Terminen mit bekannter Herkunft (direkt gebuchte zählen dazu).
 
 Gespeichert wird wie jede Korrektur über **Für alle speichern** (`korrekturen.termine` in den verschlüsselten Daten).
 

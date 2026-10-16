@@ -337,9 +337,9 @@ test('Gleiche Person trotz Umlaut-Schreibweise (Kämper = Kaemper)', () => {
 });
 test('Fall 1 Referral: ein Termin, konvertiert ist Mittelstädt, nicht der Angerufene', () => {
   const r = mitTerminen({ t1: referralTermin });
-  // Termine: der Eintrag + Jensen (Termin laut Notiz, Herkunft nicht erfasst)
-  assert.deepEqual(r.terminListe.map(t => [t.kontakt.name, t.erfasst]), [['Maren Jensen', false], ['Nicholas Mittelstädt', true]]);
-  assert.deepEqual([r.terminKpi.gesamt, r.terminKpi.referral, r.terminKpi.referralQuote, r.terminKpi.nichtErfasst], [2, 1, 1, 1]);
+  // Termine: der Eintrag + Jensen (Termin laut Notiz, ohne Angaben → direkt gebucht)
+  assert.deepEqual(r.terminListe.map(t => [t.kontakt.name, !!t.direkt]), [['Maren Jensen', true], ['Nicholas Mittelstädt', false]]);
+  assert.deepEqual([r.terminKpi.gesamt, r.terminKpi.referral, r.terminKpi.referralQuote, r.terminKpi.direkt, r.terminKpi.nichtErfasst], [2, 1, 0.5, 1, 0]);
   assert.deepEqual(r.pipeline.termin.map(e => e.name).sort(), ['Maren Jensen', 'Nicholas Mittelstädt']);
   assert.deepEqual(r.pipeline.pending.map(e => e.name), ['Peter Schmidt']);        // bleibt mit eigenem Stand
   assert.equal(r.kontaktListe.find(k => k.name === 'Peter Schmidt').termin, false);
@@ -348,7 +348,7 @@ test('Fall 1 Referral: ein Termin, konvertiert ist Mittelstädt, nicht der Anger
 test('Fall 2 Listenkontakt ≠ real: Anruf mit Termin und Eintrag zählen zusammen genau einmal', () => {
   const r = mitTerminen({ t2: listenTermin });
   assert.equal(r.terminListe.length, 1);
-  assert.deepEqual([r.terminKpi.abweichend, r.terminKpi.referral, r.terminKpi.nichtErfasst, r.terminKpi.kanal.email], [1, 0, 0, 1]);
+  assert.deepEqual([r.terminKpi.abweichend, r.terminKpi.referral, r.terminKpi.direkt, r.terminKpi.kanal.email], [1, 0, 0, 1]);
   assert.deepEqual(r.pipeline.termin.map(e => e.name), ['Maren Jensen']);           // nicht Hahner
 });
 test('Beide Fälle zusammen: 2 Termine, 1 mit Referral (50 %), Stichprobe als klein markiert', () => {
@@ -356,6 +356,13 @@ test('Beide Fälle zusammen: 2 Termine, 1 mit Referral (50 %), Stichprobe als kl
   const k = r.terminKpi;
   assert.deepEqual([k.gesamt, k.erfasst, k.referral, k.referralQuote, k.abweichend, k.referralKleineStichprobe], [2, 2, 1, 0.5, 2, true]);
   assert.deepEqual([k.quelle.cold_call, k.kanal.linkedin, k.kanal.email], [2, 1, 1]);
+});
+test('Keine Angaben = direkt gebucht: Cold Call, kein Referral, Telefon, keine Kette über andere Personen', () => {
+  const r = mitTerminen({});
+  const t = r.terminListe[0];
+  assert.deepEqual([r.terminListe.length, t.kontakt.name, t.listenkontakt.name, t.quelle, t.referral, t.kanal, t.direkt, t.erfasst],
+    [1, 'Maren Jensen', 'Maren Jensen', 'cold_call', false, 'telefon', true, true]);
+  assert.deepEqual([r.terminKpi.referral, r.terminKpi.referralQuote, r.terminKpi.abweichend, r.terminKpi.kanal.telefon], [0, 0, 0, 1]);
 });
 test('Gelöschter Eintrag (null) zählt nicht, späterer Stand gewinnt, Zeitraum nach Buchungsdatum', () => {
   const e = A.terminEintraegeAus([{ termine: { t1: referralTermin, t2: listenTermin } }, { termine: { t1: null, t2: { ...listenTermin, datum: '2026-10-06' } } }]);

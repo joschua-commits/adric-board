@@ -835,9 +835,10 @@ function wendeKorrekturenAn(anrufe, korrekturen) {
    - listenkontakt: wer in Kampagne/Liste zugewiesen war (optional, nur zur Info).
    - anrufId:       Engagement ID des Anrufs, mit dem die Kette begann (optional).
    Jeder Eintrag ist GENAU EIN Termin, egal wie viele Personen in der Kette stehen.
-   Anrufe mit Termin (KI oder Korrektur) ohne Eintrag zählen weiter einzeln mit,
-   sind aber als "Herkunft nicht erfasst" markiert. Ist ein Eintrag mit dem Anruf
-   verknüpft, zählt nur der Eintrag.
+   Anrufe mit Termin (KI oder Korrektur) ohne Eintrag gelten als DIREKT GEBUCHT
+   (Vorgabe des Users: keine Angabe = keine Kette): Cold Call, kein Referral,
+   Listenkontakt = Angerufener, gebucht am Telefon, am Tag des Anrufs.
+   Ist ein Eintrag mit dem Anruf verknüpft, zählt nur der Eintrag.
    Gespeichert in korrekturen.termine: { [id]: Eintrag | null }  (null = gelöscht)
    ===================================================================== */
 const TERMIN_QUELLEN = { cold_call: 'Cold Call', linkedin: 'LinkedIn', inbound: 'Inbound', referral: 'Empfehlung/Referral', bestand: 'Bestandskontakt' };
@@ -920,7 +921,7 @@ function anrufKontaktKonvertiert(a) {
   return !!ich && a.terminEintraege.some(e => personSchluessel(e.kontakt.name) === ich);
 }
 
-// Ein Termin je Eintrag, dazu je Anruf mit Termin ohne Eintrag einer ("Herkunft nicht erfasst")
+// Ein Termin je Eintrag, dazu je Anruf mit Termin ohne Eintrag einer ("direkt gebucht")
 function terminListeAus(alleAnrufe, eintraege, imZeitraum) {
   const nachId = new Map(alleAnrufe.filter(a => a.engagementId).map(a => [a.engagementId, a]));
   const liste = (eintraege || []).filter(e => imZeitraum(e.datum)).map(e => ({ ...e, anruf: nachId.get(e.anrufId) || null }));
@@ -928,8 +929,9 @@ function terminListeAus(alleAnrufe, eintraege, imZeitraum) {
     if (!a.termin || (a.terminEintraege && a.terminEintraege.length) || !imZeitraum(a.tag)) continue;
     const name = `${a.vorname} ${a.nachname}`.trim();
     liste.push({ id: 'anruf-' + (a.engagementId || kiSchluessel(a)), datum: a.tag, listenkontakt: { name, firma: a.firma || '' },
-      kontakt: { name, firma: a.firma || '', rolle: a.jobtitel || '' }, quelle: '', referral: null, kette: '', kanal: '',
-      anrufId: a.engagementId || '', notiz: '', erfasst: false, fehler: [], anruf: a });
+      kontakt: { name, firma: a.firma || '', rolle: a.jobtitel || '' }, quelle: 'cold_call', referral: false,
+      kette: `Cold Call (${name || a.firma || '–'}), direkt gebucht`, kanal: 'telefon',
+      anrufId: a.engagementId || '', notiz: '', erfasst: true, direkt: true, fehler: [], anruf: a });
   }
   return liste.sort((x, y) => x.datum.localeCompare(y.datum) || x.id.localeCompare(y.id));
 }
@@ -941,7 +943,8 @@ function terminKennzahlen(liste) {
   return {
     gesamt: liste.length,
     erfasst: erfasst.length,
-    nichtErfasst: liste.length - erfasst.length,
+    nichtErfasst: liste.length - erfasst.length,            // nur alte Termine ohne Anruf und ohne Angaben
+    direkt: liste.filter(t => t.direkt).length,             // Anruf-Termin ohne Eintrag: direkt gebucht, keine Kette
     referral,
     referralQuote: erfasst.length ? referral / erfasst.length : null,     // Basis: Termine mit erfasster Herkunft
     referralKleineStichprobe: erfasst.length < MINDEST_STICHPROBE,
@@ -1700,7 +1703,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       `<strong>${zahl(g.gespraech)}</strong> echte Gespräche (${prozent(g.quote)}${g.kleineStichprobe ? ', Stichprobe klein' : ''}), ${zahl(g.abgewimmelt)} abgewimmelt, ${zahl(g.niemand)} ohne Kontakt` +
       (g.unklar ? `, ${zahl(g.unklar)} unklar` : '') + ` und <strong>${zahl(termineGesamt)}</strong> Termin${termineGesamt === 1 ? '' : 'e'}. ` +
       `${zahl(kl.length)} Kontakte bei ${zahl(r.firmen)} Firmen angerufen, ${zahl(mitG)} davon gesprochen.` +
-      (r.terminKpi.referral ? ` <strong>${zahl(r.terminKpi.referral)}</strong> Termin${r.terminKpi.referral === 1 ? '' : 'e'} mit Referral in der Kette (${prozent(r.terminKpi.referralQuote)} der erfassten${r.terminKpi.referralKleineStichprobe ? ', Stichprobe klein' : ''}).` : '');
+      (r.terminKpi.referral ? ` <strong>${zahl(r.terminKpi.referral)}</strong> Termin${r.terminKpi.referral === 1 ? '' : 'e'} mit Referral in der Kette (${prozent(r.terminKpi.referralQuote)} der Termine${r.terminKpi.referralKleineStichprobe ? ', Stichprobe klein' : ''}).` : '');
     if (v && v.gesamt.anrufe) {
       const d = (a, b) => (a - b > 0 ? '+' : a - b < 0 ? '−' : '±') + Math.abs(a - b);
       t += ` Gegenüber ${esc(vName)}: Anrufe ${d(g.anrufe, v.gesamt.anrufe)}, Gespräche ${d(g.gespraech, v.gesamt.gespraech)}, Termine ${d(termineGesamt, v.terminListe.length)}.`;
@@ -1762,16 +1765,16 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   const personText = p => p && p.name ? esc(p.name) + (p.firma ? ` <span class="klein-text">(${esc(p.firma)})</span>` : '') : '–';
   function terminKarte(t) {
     const a = t.anruf;
-    const anders = t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name);
+    const anders = !t.direkt && t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name);
     const knopf = String(t.id).startsWith('ohne-anruf-') ? ''
-      : t.erfasst || t.id.startsWith('t-') || (t.fehler && t.fehler.length) ? `<button class="knopf leise klein" type="button" data-termin-bearbeiten="${esc(t.id)}">Bearbeiten</button>`
-      : `<button class="knopf leise klein" type="button" data-termin-neu data-anruf="${esc(t.anrufId)}">Herkunft erfassen</button>`;
+      : t.direkt ? `<button class="knopf leise klein" type="button" data-termin-vorlage="${esc(t.id)}">Abweichung erfassen</button>`
+      : `<button class="knopf leise klein" type="button" data-termin-bearbeiten="${esc(t.id)}">Bearbeiten</button>`;
     return `<article class="termin${t.erfasst ? '' : ' offen'}">
       <div class="wann">${tagKurz(t.datum)}${t.kanal ? ` · gebucht per ${esc(TERMIN_KANAELE[t.kanal])}` : ''}</div>
       <div class="wer">${esc(t.kontakt.name || '–')}</div>
       <div class="firma">${esc(t.kontakt.firma || '–')}${t.kontakt.rolle ? ' · ' + esc(t.kontakt.rolle) : ''}</div>
       <div class="schritt">${t.erfasst
-        ? `<span class="chip">Quelle: ${esc(TERMIN_QUELLEN[t.quelle])}</span>${t.referral ? '<span class="chip chip-referral">Referral in der Kette</span>' : ''}`
+        ? `<span class="chip">Quelle: ${esc(TERMIN_QUELLEN[t.quelle])}</span>${t.referral ? '<span class="chip chip-referral">Referral in der Kette</span>' : ''}${t.direkt ? '<span class="chip" title="Keine Angaben erfasst: gilt als direkt im Anruf gebucht">direkt gebucht · Standard</span>' : ''}`
         : '<span class="chip chip-warn">Herkunft nicht erfasst</span>'}</div>
       ${t.kette ? `<div class="kette">${kettePfeile(t.kette)}</div>` : ''}
       <dl class="termin-felder">
@@ -1779,7 +1782,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <dt>Listenkontakt</dt><dd>${personText(t.listenkontakt)}${anders ? ' <span class="chip chip-warn">weicht ab</span>' : ''}</dd>
         <dt>Ausgangsanruf</dt><dd>${a ? `${tagKurz(a.tag)} ${uhrzeit(a.zeit)} · ${esc(`${a.vorname} ${a.nachname}`.trim() || '–')}` : t.anrufId ? `ID ${esc(t.anrufId)} (nicht in den Daten)` : '–'}</dd>
       </dl>
-      ${t.notiz ? `<div class="notiz">${esc(t.notiz)}</div>` : !t.erfasst && a ? `<div class="notiz">${esc(a.notiz)}</div>` : ''}
+      ${t.notiz ? `<div class="notiz">${esc(t.notiz)}</div>` : t.direkt && a ? `<div class="notiz">${esc(a.notiz)}</div>` : ''}
       ${t.fehler && t.fehler.length ? `<p class="notiz-klein">⚠ Unvollständig: ${esc(t.fehler.join(' '))}</p>` : ''}
       ${knopf ? `<div class="termin-aktionen no-print">${knopf}</div>` : ''}
     </article>`;
@@ -1793,16 +1796,17 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       <div class="mini-kpis termin-kpis">
         <div data-liste="terminliste" title="Liste anzeigen"><div class="w">${zahl(tk.gesamt)}</div><div class="t">Termine</div></div>
         <div data-liste="terminliste:referral" title="Liste anzeigen"><div class="w">${zahl(tk.referral)} <small class="${tk.referralKleineStichprobe ? 'quote-unsicher' : ''}">${prozent(tk.referralQuote)}</small></div>
-          <div class="t">mit Referral in der Kette${tk.erfasst ? ` · Anteil an ${zahl(tk.erfasst)} erfassten` : ''}</div>
+          <div class="t">mit Referral in der Kette${tk.erfasst ? ` · Anteil an ${zahl(tk.erfasst)} Termin${tk.erfasst === 1 ? '' : 'en'}` : ''}</div>
           ${tk.erfasst && tk.referralKleineStichprobe ? kleinHinweis(tk.erfasst) : ''}</div>
         <div data-liste="terminliste:abweichend" title="Liste anzeigen"><div class="w">${zahl(tk.abweichend)}</div><div class="t">Listenkontakt ≠ tatsächlicher Kontakt</div></div>
-        <div data-liste="terminliste:offen" title="Liste anzeigen"><div class="w">${zahl(tk.nichtErfasst)}</div><div class="t">Herkunft nicht erfasst</div></div>
+        <div data-liste="terminliste:direkt" title="Liste anzeigen"><div class="w">${zahl(tk.direkt)}</div><div class="t">direkt gebucht, ohne Kette (keine Angaben)</div>
+          ${tk.nichtErfasst ? `<div class="t">dazu ${zahl(tk.nichtErfasst)} ohne Herkunft</div>` : ''}</div>
       </div>
       <div class="termin-verteilung">${verteilung('Quelle (erster Kontakt)', TERMIN_QUELLEN, tk.quelle)}${verteilung('Buchungskanal', TERMIN_KANAELE, tk.kanal)}</div>
       ${r.terminListe.length ? `<div class="termine">${r.terminListe.slice().reverse().map(terminKarte).join('')}</div>` : '<p class="notiz-klein">Keine gebuchten Termine im Zeitraum.</p>'}
       <p class="notiz-klein">Referral ist der ertragreichste Kanal (Branche: ${esc(BENCHMARK.referral)}). Konvertiert zählt immer der <strong>tatsächliche Kontakt</strong> (Pipeline, Kontakte);
         der Listenkontakt steht nur zur Info da. Anruf-Kennzahlen (Trichter, Uhrzeit, Nummerntyp, Persona, Firmen) rechnen den Termin dem Ausgangsanruf zu.
-        Termine ohne erfasste Herkunft zählen mit, aber nicht im Referral-Anteil.</p>`;
+        Termin aus einem Anruf ohne weitere Angaben = direkt mit dieser Person gebucht (Cold Call, Telefon, keine Kette). Weicht es ab: „Abweichung erfassen“.</p>`;
   }
 
   function zeichne() {
@@ -2111,6 +2115,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
       const auswahl = {
         referral: ['mit Referral in der Kette', t => t.erfasst && t.referral === true],
         abweichend: ['Listenkontakt ≠ tatsächlicher Kontakt', t => t.erfasst && t.listenkontakt.name && personSchluessel(t.listenkontakt.name) !== personSchluessel(t.kontakt.name)],
+        direkt: ['direkt gebucht, ohne Kette', t => t.direkt],
         offen: ['Herkunft nicht erfasst', t => !t.erfasst],
       }[art] || ['', () => true];
       const liste = r.terminListe.filter(auswahl[1]).reverse();
@@ -2123,7 +2128,7 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
         <tbody>${liste.map(e => {
           const t = e.termin || (e.anruf && r.terminListe.find(x => x.anruf === e.anruf));
           return `<tr><td><strong>${esc(e.name)}</strong><div class="klein-text">${esc(e.firma || '–')}</div></td>
-            <td class="klein-text">${t && t.kette ? kettePfeile(t.kette) : 'Herkunft nicht erfasst'}</td>
+            <td class="klein-text">${t && t.kette ? kettePfeile(t.kette) : '–'}</td>
             <td class="neben klein-text">${e.anruf ? `${tagKurz(e.anruf.tag)} · ${esc(`${e.anruf.vorname} ${e.anruf.nachname}`.trim())}` : '–'}</td></tr>`;
         }).join('')}</tbody></table>`;
     } else if (schluessel === 'kontakte') {
@@ -2409,6 +2414,13 @@ dialog.liste .inhalt { padding: 8px 20px 20px; overflow: auto; max-height: calc(
   document.addEventListener('click', e => {
     const neu = e.target.closest('[data-termin-neu]');
     if (neu) { if ($('#liste').open) $('#liste').close(); oeffneTerminForm(neu.dataset.anruf ? { anrufId: neu.dataset.anruf } : null); return; }
+    const vorlage = e.target.closest('[data-termin-vorlage]');
+    if (vorlage) {
+      const t = letzteAuswertung && letzteAuswertung.terminListe.find(x => x.id === vorlage.dataset.terminVorlage);
+      if ($('#liste').open) $('#liste').close();
+      if (t) oeffneTerminForm({ ...t, id: undefined, kette: '' });
+      return;
+    }
     const bearb = e.target.closest('[data-termin-bearbeiten]');
     if (bearb) {
       const t = zustand.termine.find(x => x.id === bearb.dataset.terminBearbeiten);
